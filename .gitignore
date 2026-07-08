@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# 장비별 실제 설정과 인증정보
+config.home.json
+config.school.json
+
+# 실행 중 생성되는 데이터
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+logs/
+data/
+captures/
+
+# 편집기 및 운영체제 파일
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

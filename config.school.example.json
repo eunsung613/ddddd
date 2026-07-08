@@ -1,0 +1,17 @@
+{
+  "serial_port": "COM_PORT_HERE",
+  "serial_baudrate": 115200,
+  "mqtt_broker": "broker.hivemq.com",
+  "mqtt_port": 1883,
+  "mqtt_client_id": "school_server_bridge_001",
+  "site_id": "school",
+  "zone_id": "room1",
+  "device_id": "pico2w_001",
+  "bridge_id": "school_server_bridge_001",
+  "topics": {
+    "telemetry": "farm/school/room1/pico2w_001/telemetry",
+    "status": "farm/school/room1/pico2w_001/status",
+    "cmd": "farm/school/room1/pico2w_001/cmd",
+    "ack": "farm/school/room1/pico2w_001/ack"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "mqtt_broker": "broker.hivemq.com",
+  "mqtt_port": 1883,
+  "mqtt_subscriber_client_id_prefix": "home_gaming_laptop_subscriber",
+  "mqtt_command_client_id_prefix": "home_cmd_client",
+  "print_interval_sec": 10,
+  "topics": {
+    "telemetry": "farm/school/room1/pico2w_001/telemetry",
+    "status": "farm/school/room1/pico2w_001/status",
+    "cmd": "farm/school/room1/pico2w_001/cmd",
+    "ack": "farm/school/room1/pico2w_001/ack"
+  }
+}
