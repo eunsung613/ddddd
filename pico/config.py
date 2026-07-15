@@ -17,10 +17,12 @@ UART_RX_PIN = 1
 RS485_DE_PIN = 2
 RS485_RE_PIN = 3
 
-# I2C1 shared bus: DS3231, SCD40, SHT40
+# I2C1 shared bus: SCD40 and AHT10
 I2C_ID = 1
 I2C_SDA_PIN = 14
 I2C_SCL_PIN = 15
+SCD40_I2C_ADDRESS = 0x62
+AHT10_I2C_ADDRESS = 0x38
 
 # DC relay control signals (GPIO number, not Pico physical pin number)
 # Relay module input specifications and active HIGH/LOW are not defined yet.

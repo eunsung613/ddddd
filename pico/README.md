@@ -17,8 +17,8 @@
 | UART0 RX | GP1 |
 | RS485 DE | GP2 |
 | RS485 ~RE | GP3 |
-| I2C1 SDA | GP14 |
-| I2C1 SCL | GP15 |
+| I2C1 SDA / SCD40 + AHT10 | GP14 (physical pin 19) |
+| I2C1 SCL / SCD40 + AHT10 | GP15 (physical pin 20) |
 | Relay S1 / LED | GP16 (physical pin 21) |
 | Relay S2 / solenoid | GP17 (physical pin 22) |
 | Relay S3 / supply pump | GP18 (physical pin 24) |
