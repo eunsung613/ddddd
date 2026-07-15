@@ -22,6 +22,16 @@ I2C_ID = 1
 I2C_SDA_PIN = 14
 I2C_SCL_PIN = 15
 
+# DC relay control signals (GPIO number, not Pico physical pin number)
+# Relay module input specifications and active HIGH/LOW are not defined yet.
+RELAY_S1_LED_PIN = 16          # Pico physical pin 21
+RELAY_S2_SOLENOID_PIN = 17     # Pico physical pin 22
+RELAY_S3_SUPPLY_PUMP_PIN = 18  # Pico physical pin 24
+RELAY_S4_MIXING_PUMP_PIN = 19  # Pico physical pin 25
+RELAY_S5_EC_PUMP_PIN = 20      # Pico physical pin 26
+RELAY_S6_PH_PUMP_PIN = 21      # Pico physical pin 27
+RELAY_S7_SPARE_PIN = 22        # Pico physical pin 29; purpose not specified
+
 # PE350 / PE300 compatible Modbus RTU settings
 PE350_SLAVE_ID = 31
 PE350_EC_REGISTER = 0x0001
