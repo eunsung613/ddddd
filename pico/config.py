@@ -1,0 +1,32 @@
+"""
+Pico 2 smart farm hardware pin settings.
+
+현재 단계에서는 PE350 Modbus RTU 읽기 테스트만 수행한다.
+펌프/릴레이 출력 핀은 실제 단독 시험 전까지 이 파일에 정의하지 않는다.
+"""
+
+# RS485 / PmodRS485 Rev.B / PE350
+UART_ID = 0
+RS485_BAUD_RATE = 9600
+RS485_BITS = 8
+RS485_PARITY = None
+RS485_STOP = 1
+
+UART_TX_PIN = 0
+UART_RX_PIN = 1
+RS485_DE_PIN = 2
+RS485_RE_PIN = 3
+
+# I2C1 shared bus: DS3231, SCD40, SHT40
+I2C_ID = 1
+I2C_SDA_PIN = 14
+I2C_SCL_PIN = 15
+
+# PE350 / PE300 compatible Modbus RTU settings
+PE350_SLAVE_ID = 31
+PE350_EC_REGISTER = 0x0001
+PE350_PH_REGISTER = 0x0002
+PE350_TEMPERATURE_REGISTER = 0x0003
+
+PE350_RESPONSE_TIMEOUT_MS = 1000
+PE350_FRAME_SILENCE_MS = 20
