@@ -64,8 +64,11 @@ def parse_sensor_line(line: str, pending: dict[str, float]) -> dict[str, float] 
 
 
 def start_pico_test(pico: serial.Serial) -> None:
-    pico.write(b"\r\x03\x03")
-    time.sleep(0.3)
+    # Stop any running script, then force the Pico back to the friendly REPL.
+    # mpremote/Thonny may leave MicroPython in raw REPL mode, where a normal
+    # Python command sent over serial is not executed.
+    pico.write(b"\r\x03\x03\x02")
+    time.sleep(0.5)
     pico.reset_input_buffer()
     pico.write(b"import pe350_read_only_test; pe350_read_only_test.main()\r\n")
 
