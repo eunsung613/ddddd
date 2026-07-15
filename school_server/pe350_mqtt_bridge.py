@@ -158,6 +158,9 @@ def main() -> None:
                 )
     except KeyboardInterrupt:
         print("\n브리지를 종료합니다.")
+    except serial.SerialException as error:
+        print(f"\nPico COM 포트를 열 수 없습니다: {error}")
+        print("Thonny를 완전히 종료하고 COM 포트 번호를 확인한 뒤 다시 실행하세요.")
     finally:
         client.loop_stop()
         client.disconnect()
