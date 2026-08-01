@@ -7,25 +7,14 @@ Measure each Pico pin against Pico GND with a multimeter.
 import time
 from machine import Pin
 
-from config import (
-    RELAY_S1_LED_PIN,
-    RELAY_S2_RAW_WATER_PIN,
-    RELAY_S3_SUPPLY_PUMP_PIN,
-    RELAY_S4_MIXING_PUMP_PIN,
-    RELAY_S5_EC_PUMP_PIN,
-    RELAY_S6_PH_PUMP_PIN,
-    RELAY_S7_FAN_PIN,
-)
-
-
 CHANNELS = (
-    ("LED", RELAY_S1_LED_PIN, 21),
-    ("RAW_WATER", RELAY_S2_RAW_WATER_PIN, 22),
-    ("SUPPLY", RELAY_S3_SUPPLY_PUMP_PIN, 24),
-    ("MIXING", RELAY_S4_MIXING_PUMP_PIN, 25),
-    ("EC", RELAY_S5_EC_PUMP_PIN, 26),
-    ("PH", RELAY_S6_PH_PUMP_PIN, 27),
-    ("FAN", RELAY_S7_FAN_PIN, 29),
+    ("LED", 16, 21),
+    ("RAW_WATER", 17, 22),
+    ("SUPPLY", 18, 24),
+    ("MIXING", 19, 25),
+    ("EC", 20, 26),
+    ("PH", 21, 27),
+    ("FAN", 22, 29),
 )
 
 outputs = [(name, Pin(gpio, Pin.OUT, value=0), gpio, physical) for name, gpio, physical in CHANNELS]
