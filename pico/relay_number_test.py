@@ -1,6 +1,5 @@
 """Test active-HIGH relay inputs one at a time."""
 
-import time
 from machine import Pin
 
 
@@ -28,7 +27,7 @@ def all_off():
 all_off()
 print("Active-HIGH relay test")
 print("1=LED, 2=RAW_WATER, 3=SUPPLY, 4=MIXING, 5=EC, 6=PH, 7=FAN")
-print("Each relay turns ON for 2 seconds and then turns OFF automatically.")
+print("The selected relay stays ON. Enter 0 or another number to turn it OFF.")
 print("0=ALL OFF, q=QUIT")
 
 if input("Type SAFE after disconnecting 24 V actuator power: ").strip() != "SAFE":
@@ -54,9 +53,6 @@ else:
             name, pin = relays[command]
             pin.value(1)
             print("{} ON".format(name))
-            time.sleep(2)
-            pin.value(0)
-            print("{} OFF".format(name))
     finally:
         all_off()
         print("Test ended. All relays are OFF.")
