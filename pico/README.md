@@ -20,12 +20,12 @@
 | I2C1 SDA / SCD40 + AHT10 | GP14 (physical pin 19) |
 | I2C1 SCL / SCD40 + AHT10 | GP15 (physical pin 20) |
 | Relay S1 / LED | GP16 (physical pin 21) |
-| Relay S2 / solenoid | GP17 (physical pin 22) |
+| Relay S2 / raw water | GP17 (physical pin 22) |
 | Relay S3 / supply pump | GP18 (physical pin 24) |
 | Relay S4 / mixing pump | GP19 (physical pin 25) |
 | Relay S5 / EC dosing pump | GP20 (physical pin 26) |
 | Relay S6 / pH dosing pump | GP21 (physical pin 27) |
-| Relay S7 / spare | GP22 (physical pin 29) |
+| Relay S7 / fan | GP22 (physical pin 29) |
 
 현재 단독 시험에서는 PmodRS485 VCC를 Pico 2 W 36번 `3V3(OUT)`으로 공급하고 Pmod GND를 Pico GND와 연결했습니다.
 실제 PE350은 별도 5V 전원으로 공급하며, PE350 전원 GND와 Pico GND는 연결하지 않습니다.
