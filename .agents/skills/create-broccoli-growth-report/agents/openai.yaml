@@ -1,0 +1,4 @@
+interface:
+  display_name: "브로콜리 생육 보고서"
+  short_description: "농장 데이터를 검증해 신뢰 가능한 생육 보고서를 만듭니다."
+  default_prompt: "Use $create-broccoli-growth-report to validate camera and sensor data, then create a trustworthy broccoli growth report."

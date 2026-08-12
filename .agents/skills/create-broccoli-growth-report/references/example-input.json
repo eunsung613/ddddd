@@ -1,0 +1,137 @@
+{
+  "report": {
+    "date": "2026-05-05",
+    "crop": "브로콜리",
+    "facility": "FFK 스마트팜",
+    "zone": "재배구역 1",
+    "dat": null,
+    "growth_stage": "영양생장기",
+    "report_type": "일간 보고",
+    "team": "FFK 스마트팜팀",
+    "operators": ["이은성", "김태현"]
+  },
+  "image": {
+    "camera_id": "Camera 01",
+    "capture_time": "1970-01-02T20:49:48+09:00",
+    "server_received_time": "2026-05-05T13:50:40+09:00",
+    "timestamp_status": "경고",
+    "resolution": "640x360",
+    "viewpoint": "고정형 상부 사선",
+    "overall_status": "정상",
+    "confidence": "중간",
+    "confidence_reason": "군락 전체는 보이지만 생장점, 잎 뒷면, 뿌리는 보이지 않음",
+    "observations": [
+      "잎이 재배 베드 외곽 방향으로 전개되어 있음",
+      "프레임 범위에서 광범위 황화와 군락 전체 시듦은 확인되지 않음",
+      "병해충, 생장점, 잎 뒷면 및 뿌리 상태는 판단 불가"
+    ],
+    "metrics": [
+      {
+        "name": "캐노피 피복도",
+        "status": "산출 불가",
+        "value": null,
+        "reason": "재배 영역 ROI와 검증된 식물 분할 마스크가 없음"
+      },
+      {
+        "name": "녹색도 지수",
+        "status": "산출 불가",
+        "value": null,
+        "reason": "노출과 화이트밸런스가 고정되지 않았고 OpenCV 계산을 수행하지 않음"
+      },
+      {
+        "name": "개체 균일도",
+        "status": "산출 불가",
+        "value": null,
+        "reason": "개체별 ROI 또는 검증된 인스턴스 분할 결과가 없음"
+      }
+    ]
+  },
+  "sensors": [
+    {
+      "name": "EC",
+      "source_type": "가상",
+      "sensor_id": "PE350-demo",
+      "mean": 1.72,
+      "min": 1.66,
+      "max": 1.78,
+      "unit": "dS/m",
+      "accepted_min": 1.5,
+      "accepted_max": 2.0,
+      "sample_count": 0,
+      "period_start": "2026-05-05T00:00:00+09:00",
+      "period_end": "2026-05-05T23:59:59+09:00",
+      "calibration_date": null
+    },
+    {
+      "name": "pH",
+      "source_type": "가상",
+      "sensor_id": "PE350-demo",
+      "mean": 6.14,
+      "min": 6.02,
+      "max": 6.28,
+      "unit": "pH",
+      "accepted_min": 5.5,
+      "accepted_max": 6.5,
+      "sample_count": 0,
+      "period_start": "2026-05-05T00:00:00+09:00",
+      "period_end": "2026-05-05T23:59:59+09:00",
+      "calibration_date": null
+    },
+    {
+      "name": "기온",
+      "source_type": "가상",
+      "sensor_id": "AHT10-demo",
+      "mean": 22.6,
+      "min": 20.8,
+      "max": 24.7,
+      "unit": "°C",
+      "accepted_min": 18.0,
+      "accepted_max": 25.0,
+      "sample_count": 0,
+      "period_start": "2026-05-05T00:00:00+09:00",
+      "period_end": "2026-05-05T23:59:59+09:00",
+      "calibration_date": null
+    },
+    {
+      "name": "상대습도",
+      "source_type": "가상",
+      "sensor_id": "AHT10-demo",
+      "mean": 68.3,
+      "min": 61.0,
+      "max": 75.0,
+      "unit": "%",
+      "accepted_min": 60.0,
+      "accepted_max": 80.0,
+      "sample_count": 0,
+      "period_start": "2026-05-05T00:00:00+09:00",
+      "period_end": "2026-05-05T23:59:59+09:00",
+      "calibration_date": null
+    }
+  ],
+  "system": {
+    "status": "주의",
+    "anomalies": [
+      "카메라 화면 시간이 1970년으로 표시됨",
+      "Asia/Seoul 시간대, NTP 동기화, RTC 또는 내장 배터리 점검 필요"
+    ]
+  },
+  "recommendations": [
+    "카메라 시간대와 NTP 서버를 확인한 후 재동기화",
+    "동일 구도와 동일 조명에서 다음 사진을 촬영",
+    "생장점과 잎 뒷면을 근접 촬영하여 현장 점검",
+    "실측 PE350 및 환경 센서 데이터로 가상값을 교체"
+  ],
+  "conclusion": "제공된 사진에서 브로콜리 군락의 잎 전개는 확인되며 광범위 황화와 군락 전체 시듦은 명확하지 않다. 다만 정량 영상 분석과 실측 센서 데이터가 없어 병해충과 생리장해를 확정할 수 없다.",
+  "analysis": {
+    "model_id": "운영 예정: OpenAI GPT-5.6 Sol",
+    "prompt_version": "daily-growth-v1.0",
+    "generated_at": "2026-08-12T18:00:00+09:00",
+    "code_version": "portable-report-v1"
+  },
+  "review": {
+    "reviewer": "유혜진",
+    "approved": false,
+    "reviewed_at": null,
+    "human_result": "검토 대기"
+  }
+}

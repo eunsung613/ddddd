@@ -61,3 +61,24 @@ git remote add origin <GITHUB_PRIVATE_REPOSITORY_URL>
 git branch -M main
 git push -u origin main
 ```
+
+## 서버 노트북에서 생육 보고서 만들기
+
+보고서 스킬은 저장소 루트의 `.agents/skills/create-broccoli-growth-report`에 있습니다. 서버 노트북에서 이 저장소를 `git pull`한 뒤 저장소 폴더를 VS Code/Codex로 열면 `$create-broccoli-growth-report`를 사용할 수 있습니다. 목록에 바로 나타나지 않으면 Codex를 한 번 다시 시작합니다.
+
+PDF 생성 의존성은 서버 노트북에서 한 번만 설치합니다.
+
+```powershell
+py -m pip install -r requirements-report.txt
+```
+
+실측 데이터 JSON과 새 카메라 사진이 준비되면 다음 형식으로 생성합니다.
+
+```powershell
+py .agents\skills\create-broccoli-growth-report\scripts\generate_daily_report.py `
+  --input <일일데이터.json> `
+  --photo <카메라사진.jpg> `
+  --output <저장할보고서.pdf>
+```
+
+입력 형식은 `.agents/skills/create-broccoli-growth-report/references/example-input.json`을 참고합니다. 이 예제의 센서값은 `가상`으로 표시되어 있으므로 실운영 보고서에는 서버가 수집한 실측값으로 교체해야 합니다. 현재 단계는 Codex 또는 명령줄에서 보고서를 만드는 기능이며, 6시간 촬영·OpenAI API 호출·텔레그램 전송을 자동 실행하는 서버 작업은 아직 구현하지 않았습니다.
