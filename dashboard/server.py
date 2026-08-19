@@ -193,6 +193,10 @@ def simulation_worker() -> None:
 
 def latest_with_health() -> dict[str, Any]:
     latest = store.latest_sensor() or {}
+    if latest:
+        record_is_simulation = str(latest.get("source", "")).startswith("simulation:")
+        if record_is_simulation != SIMULATION:
+            latest = {}
     with state_lock:
         runtime = dict(runtime_state)
     epoch = runtime.get("updated_at_epoch")

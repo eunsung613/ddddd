@@ -181,12 +181,19 @@ def handle_command(line):
 
 
 def read_telemetry(environment, pe350):
-    air_temp, humidity, co2, scd_temp, scd_humidity = environment.read()
-    ec_raw = pe350.read_ec_us_cm()
-    time.sleep_ms(100)
-    ph_raw = pe350.read_ph_raw()
-    time.sleep_ms(100)
-    solution_temp_raw = pe350.read_temperature_raw()
+    try:
+        air_temp, humidity, co2, scd_temp, scd_humidity = environment.read()
+    except Exception as error:
+        raise RuntimeError("I2C environment sensors: " + str(error))
+
+    try:
+        ec_raw = pe350.read_ec_us_cm()
+        time.sleep_ms(100)
+        ph_raw = pe350.read_ph_raw()
+        time.sleep_ms(100)
+        solution_temp_raw = pe350.read_temperature_raw()
+    except Exception as error:
+        raise RuntimeError("PE350: " + str(error))
     return {
         "type": "telemetry",
         "air_temp": round(air_temp, 2),
