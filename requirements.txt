@@ -1,2 +1,5 @@
 paho-mqtt>=2.0,<3.0
 pyserial>=3.5,<4.0
+fastapi
+mpremote
+uvicorn

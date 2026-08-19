@@ -1,6 +1,11 @@
 from machine import I2C, Pin
 import time
 
+try:
+    import ujson as json
+except ImportError:
+    import json
+
 
 I2C_ID = 1
 I2C_SDA_PIN = 14
@@ -107,10 +112,14 @@ start_scd40()
 while True:
     print("-" * 40)
 
+    aht_ok = False
+    scd40_ok = False
+
     try:
         aht_temperature, aht_humidity = read_aht10()
         print("AHT10 temperature: {:.1f} C".format(aht_temperature))
         print("AHT10 humidity   : {:.1f} %".format(aht_humidity))
+        aht_ok = True
     except Exception as error:
         print("AHT10 error:", error)
 
@@ -119,7 +128,19 @@ while True:
         print("SCD40 CO2        : {} ppm".format(co2))
         print("SCD40 temperature: {:.1f} C".format(scd_temperature))
         print("SCD40 humidity   : {:.1f} %".format(scd_humidity))
+        scd40_ok = True
     except Exception as error:
         print("SCD40 error:", error)
+
+    if aht_ok and scd40_ok:
+        payload = {
+            "type": "i2c_telemetry",
+            "air_temp_c": round(aht_temperature, 2),
+            "humidity_pct": round(aht_humidity, 2),
+            "co2_ppm": co2,
+            "scd40_temp_c": round(scd_temperature, 2),
+            "scd40_humidity_pct": round(scd_humidity, 2),
+        }
+        print("I2C_JSON:" + json.dumps(payload))
 
     time.sleep(5)
