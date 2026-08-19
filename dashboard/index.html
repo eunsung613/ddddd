@@ -45,6 +45,7 @@
     @media(max-width:760px){.app{display:block}.sidebar{display:none}.topbar{height:64px;padding:0 16px}.content{padding:20px 14px 88px}.clock{display:none}.page-head{align-items:flex-start}.page-head h1{font-size:21px}.kpis,.two,.three,.workflow-stats,.hero,.ai-layout{grid-template-columns:1fr 1fr}.mobile-nav{position:fixed;right:9px;bottom:9px;left:9px;z-index:20;display:grid;grid-template-columns:repeat(6,1fr);padding:6px;border:1px solid var(--line);border-radius:15px;background:rgba(255,255,255,.94);box-shadow:0 14px 45px rgba(30,51,80,.16);backdrop-filter:blur(16px)}.mobile-nav button{padding:8px 1px;border:0;border-radius:9px;background:transparent;color:#7b8799;font-size:8px;font-weight:700}.mobile-nav button.on{background:var(--blue-2);color:var(--blue)}}
     @media(max-width:520px){.preview-chip{max-width:145px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.page-head{display:grid;gap:12px}.page-head .actions{justify-self:start}.kpis,.two,.three,.workflow-stats,.hero,.ai-layout,.field-row{grid-template-columns:1fr}.hero-score{display:grid;justify-items:start}.camera{min-height:280px}.workflow-card p{min-height:0}.top-actions .avatar{display:none}}
   </style>
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
 <svg aria-hidden="true" width="0" height="0" style="position:absolute;overflow:hidden">
@@ -145,7 +146,7 @@
 <nav class="mobile-nav" id="mobileNav"><button class="on" data-page="overview">현황</button><button data-page="analytics">분석</button><button data-page="control">제어</button><button data-page="ai">AI</button><button data-page="automation">자동화</button><button data-page="system">시스템</button></nav>
 <div class="toast" id="toast"></div>
 
-<script>
+<script type="application/x-disabled">
   const $=id=>document.getElementById(id);
   const titles={overview:'통합 현황',analytics:'환경 분석',control:'제어 계획',ai:'AI 생육 분석',automation:'자동화 센터',system:'시스템'};
   const sample={temp:[17.4,17.2,16.9,17.1,17.6,18.1,18.8,19.4,20.1,20.4,20.0,19.6,19.2,18.9,18.7,18.6],humid:[76,77,78,77,75,73,71,69,67,66,67,69,70,71,72,72.4],co2:[590,610,625,640,655,670,720,760,735,710,690,675,660,668,676,684],light:[0,0,0,1200,6200,9800,12600,13900,14500,14200,13500,12600,8500,4200,900,0]};
@@ -171,5 +172,6 @@
   async function refreshSensors(){try{const response=await fetch('/api/sensors/latest',{cache:'no-store'});if(!response.ok)throw new Error('API 응답 오류');const data=await response.json();data.i2c_connected?setI2cOnline(data):setI2cOffline(data.i2c_error||'센서 연결 대기 중');data.pe350_connected?setPe350Online(data):setPe350Offline(data.pe350_error||'PE350 데이터 대기');setConnectionSummary(data)}catch(error){const message='FastAPI 서버와 연결할 수 없습니다';setI2cOffline(message);setPe350Offline(message);setConnectionSummary({i2c_connected:false,i2c_error:message})}}
   window.addEventListener('resize',()=>requestAnimationFrame(drawCharts));updateScoreMood();tick();setInterval(tick,1000);refreshSensors();setInterval(refreshSensors,1000);drawCharts();
 </script>
+<script src="/assets/app.js"></script>
 </body>
 </html>

@@ -11,7 +11,7 @@
 - Thonny를 종료한 뒤 `school_server/mqtt_usb_bridge.py`를 실행합니다.
 - 개인 노트북용 프로그램은 이 장비에서 실행하지 않습니다.
 
-현재 학교 노트북의 성공 코드는 아직 이 저장소에 복사되지 않았습니다. 파일을 확보하기 전까지 빈 구현을 추측해서 만들지 않습니다.
+통합 운영 코드는 `pico/smartfarm_runtime.py`와 `dashboard/server.py`에 있습니다. 기존 시험 파일은 보존하며 통합 운영 파일과 구분합니다.
 
 ### 개인 게이밍 노트북
 
@@ -45,11 +45,32 @@ python home_client\mqtt_cmd_test.py
 - 실제 장비별 설정인 `config.home.json`, `config.school.json`은 Git에서 제외합니다.
 - 향후 Broker 비밀번호와 인증서는 저장소에 올리지 않습니다.
 
+## 통합 대시보드
+
+게이밍 노트북에서는 하드웨어에 연결하지 않는 모의 실행으로 확인합니다.
+
+```powershell
+py -m pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File school_server\run_dashboard_demo.ps1
+```
+
+학교 서버 노트북에서는 `.env.example`과 `config.school.example.json`을 각각 실제 설정 파일로 복사한 뒤 실행합니다.
+
+```powershell
+git pull
+py -m pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File school_server\run_smartfarm_dashboard.ps1
+```
+
+상세 설정, 카메라, AI, 텔레그램, 외부 접속 전 안전 조건은 `dashboard/README.md`를 확인합니다.
+
 ## 현재 안전 범위
 
 - `broker.hivemq.com:1883`은 공개 테스트 Broker입니다.
 - 현재 코드는 내장 LED와 저전압 테스트에만 사용합니다.
-- 실제 펌프나 220V 부하는 연결하지 않습니다.
+- 실물 제어는 `.env`에서 명시적으로 활성화하기 전까지 차단됩니다.
+- EC/pH 정량펌프는 일반 제어와 별도의 활성화가 필요합니다.
+- AI는 직접 제어하지 않고, 제안 → 사람 승인 → 안전검사 순서만 사용합니다.
 - 제어 명령은 항상 `retain=False`를 사용합니다.
 
 ## GitHub 연결
