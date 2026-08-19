@@ -62,6 +62,12 @@ py -m pip install -r requirements.txt
 powershell -ExecutionPolicy Bypass -File school_server\run_smartfarm_dashboard.ps1
 ```
 
+외부 Wi-Fi의 게이밍 노트북은 `config.home.json`을 준비한 뒤 MQTT 읽기 전용 대시보드를 실행합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File home_client\run_remote_dashboard.ps1
+```
+
 상세 설정, 카메라, AI, 텔레그램, 외부 접속 전 안전 조건은 `dashboard/README.md`를 확인합니다.
 
 ## 현재 안전 범위

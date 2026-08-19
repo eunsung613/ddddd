@@ -15,6 +15,7 @@ import os
 import secrets
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from typing import Any
 
 import requests
 import serial
+import paho.mqtt.client as mqtt
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -45,13 +47,18 @@ CAPTURE_DIR = DATA_DIR / "captures"
 REPORT_DIR = DATA_DIR / "reports"
 DB_PATH = Path(os.getenv("SMARTFARM_DB_PATH", DATA_DIR / "smartfarm.db"))
 CONFIG_PATH = Path(os.getenv("SMARTFARM_SCHOOL_CONFIG", ROOT / "config.school.json"))
+HOME_CONFIG_PATH = Path(os.getenv("SMARTFARM_HOME_CONFIG", ROOT / "config.home.json"))
 
 SIMULATION = os.getenv("SMARTFARM_SIMULATION", "0") == "1"
 CONTROL_ENABLED = os.getenv("SMARTFARM_CONTROL_ENABLED", "0") == "1"
 CHEMICAL_CONTROL_ENABLED = os.getenv("SMARTFARM_CHEMICAL_CONTROL_ENABLED", "0") == "1"
 AUTOMATION_ENABLED = os.getenv("SMARTFARM_AUTOMATION_ENABLED", "1") == "1"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
+MQTT_MODE = os.getenv("SMARTFARM_MQTT_MODE", "off").strip().lower()
 SENSOR_STALE_SECONDS = 20
+
+if MQTT_MODE not in ("off", "publish", "subscribe"):
+    raise ValueError("SMARTFARM_MQTT_MODE must be off, publish or subscribe")
 
 ACTUATORS = {
     "led": {"label": "LED", "max_seconds": 57600},
@@ -70,6 +77,9 @@ serial_lock = threading.Lock()
 state_lock = threading.Lock()
 serial_connection: serial.Serial | None = None
 scheduler: BackgroundScheduler | None = None
+mqtt_client: mqtt.Client | None = None
+mqtt_config: dict[str, Any] | None = None
+mqtt_sequence = 0
 
 runtime_state: dict[str, Any] = {
     "pico_connected": False,
@@ -78,6 +88,8 @@ runtime_state: dict[str, Any] = {
     "updated_at_epoch": None,
     "actuators": {name: "off" for name in ACTUATORS},
     "last_ack": None,
+    "mqtt_connected": False,
+    "mqtt_error": None,
 }
 
 
@@ -118,6 +130,166 @@ def load_serial_config() -> tuple[str, int]:
     return str(port), int(config.get("serial_baudrate", 115200))
 
 
+def load_mqtt_config() -> dict[str, Any]:
+    path = CONFIG_PATH if MQTT_MODE == "publish" else HOME_CONFIG_PATH
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {path.name}")
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if not config.get("mqtt_broker") or not config.get("topics", {}).get("telemetry"):
+        raise ValueError(f"Set mqtt_broker and topics.telemetry in {path.name}")
+    return config
+
+
+def make_mqtt_client(config: dict[str, Any]) -> mqtt.Client:
+    if MQTT_MODE == "publish":
+        client_id = str(config.get("mqtt_client_id", "school_dashboard_publisher"))
+    else:
+        prefix = str(config.get("mqtt_subscriber_client_id_prefix", "home_dashboard"))
+        client_id = f"{prefix}_{uuid.uuid4().hex[:8]}"
+    if hasattr(mqtt, "CallbackAPIVersion"):
+        client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            client_id=client_id,
+        )
+    else:
+        client = mqtt.Client(client_id=client_id)
+    username = config.get("mqtt_username")
+    if username:
+        client.username_pw_set(str(username), str(config.get("mqtt_password", "")))
+    if config.get("mqtt_tls"):
+        client.tls_set()
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
+    return client
+
+
+def normalize_mqtt_telemetry(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "air_temp": data.get("air_temp", data.get("temp_c")),
+        "humidity": data.get("humidity", data.get("rh")),
+        "co2": data.get("co2", data.get("co2_ppm")),
+        "scd40_temp": data.get("scd40_temp"),
+        "scd40_humidity": data.get("scd40_humidity"),
+        "ec": data.get("ec"),
+        "ph": data.get("ph"),
+        "solution_temp": data.get("solution_temp", data.get("solution_temp_c")),
+        "actuators": data.get("actuators", {}),
+        "mqtt_ts": data.get("ts"),
+        "mqtt_seq": data.get("seq"),
+    }
+
+
+def ingest_mqtt_telemetry(data: dict[str, Any]) -> None:
+    if data.get("type") != "telemetry":
+        raise ValueError("MQTT payload type is not telemetry")
+    payload = normalize_mqtt_telemetry(data)
+    if not any(payload.get(key) is not None for key in ("air_temp", "humidity", "co2", "ec", "ph")):
+        raise ValueError("MQTT telemetry has no supported sensor value")
+    store.add_sensor(payload, "measured:mqtt_school")
+    update_runtime(
+        pico_connected=True,
+        port="MQTT",
+        last_error=None,
+        updated_at_epoch=time.time(),
+        actuators=payload.get("actuators") or runtime_state["actuators"],
+    )
+
+
+def mqtt_on_connect(
+    client: mqtt.Client,
+    _userdata: Any,
+    _flags: Any,
+    reason_code: Any,
+    _properties: Any = None,
+) -> None:
+    failed = bool(getattr(reason_code, "is_failure", False))
+    update_runtime(
+        mqtt_connected=not failed,
+        mqtt_error=str(reason_code) if failed else None,
+    )
+    if not failed and MQTT_MODE == "subscribe" and mqtt_config:
+        client.subscribe(mqtt_config["topics"]["telemetry"], qos=0)
+
+
+def mqtt_on_disconnect(
+    _client: mqtt.Client,
+    _userdata: Any,
+    _disconnect_flags: Any,
+    reason_code: Any,
+    _properties: Any = None,
+) -> None:
+    values: dict[str, Any] = {
+        "mqtt_connected": False,
+        "mqtt_error": f"MQTT disconnected: {reason_code}",
+    }
+    if MQTT_MODE == "subscribe":
+        values.update(pico_connected=False, last_error="MQTT connection lost")
+    update_runtime(**values)
+
+
+def mqtt_on_message(
+    _client: mqtt.Client,
+    _userdata: Any,
+    message: mqtt.MQTTMessage,
+) -> None:
+    try:
+        data = json.loads(message.payload.decode("utf-8"))
+        ingest_mqtt_telemetry(data)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        update_runtime(last_error=f"Invalid MQTT telemetry: {error}")
+
+
+def start_mqtt_transport() -> None:
+    global mqtt_client, mqtt_config
+    if SIMULATION or MQTT_MODE == "off":
+        return
+    mqtt_config = load_mqtt_config()
+    mqtt_client = make_mqtt_client(mqtt_config)
+    mqtt_client.on_connect = mqtt_on_connect
+    mqtt_client.on_disconnect = mqtt_on_disconnect
+    if MQTT_MODE == "subscribe":
+        mqtt_client.on_message = mqtt_on_message
+    mqtt_client.connect_async(
+        str(mqtt_config["mqtt_broker"]),
+        int(mqtt_config.get("mqtt_port", 1883)),
+        keepalive=60,
+    )
+    mqtt_client.loop_start()
+
+
+def stop_mqtt_transport() -> None:
+    global mqtt_client
+    if mqtt_client is None:
+        return
+    mqtt_client.disconnect()
+    mqtt_client.loop_stop()
+    mqtt_client = None
+
+
+def publish_mqtt_telemetry(payload: dict[str, Any]) -> None:
+    global mqtt_sequence
+    if MQTT_MODE != "publish" or mqtt_client is None or mqtt_config is None:
+        return
+    mqtt_sequence += 1
+    message = {
+        "type": "telemetry",
+        "site_id": mqtt_config.get("site_id", "school"),
+        "zone_id": mqtt_config.get("zone_id", "room1"),
+        "device_id": mqtt_config.get("device_id", "pico2w_001"),
+        "bridge_id": mqtt_config.get("bridge_id", "school_dashboard"),
+        "seq": mqtt_sequence,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        **payload,
+    }
+    result = mqtt_client.publish(
+        mqtt_config["topics"]["telemetry"],
+        json.dumps(message, ensure_ascii=False),
+        qos=0,
+        retain=False,
+    )
+    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        update_runtime(mqtt_error=f"MQTT publish failed: {result.rc}")
+
+
 def update_runtime(**values: Any) -> None:
     with state_lock:
         runtime_state.update(values)
@@ -134,6 +306,7 @@ def process_serial_line(line: str) -> None:
     if line.startswith("TELEMETRY_JSON:"):
         payload = json.loads(line.split(":", 1)[1])
         store.add_sensor(payload, "measured:pico_usb")
+        publish_mqtt_telemetry(payload)
         update_runtime(
             pico_connected=True,
             last_error=None,
@@ -191,6 +364,11 @@ def simulation_worker() -> None:
         update_runtime(updated_at_epoch=time.time())
 
 
+def mqtt_wait_worker() -> None:
+    update_runtime(port="MQTT", last_error="Waiting for school MQTT telemetry")
+    stop_event.wait()
+
+
 def latest_with_health() -> dict[str, Any]:
     latest = store.latest_sensor() or {}
     with state_lock:
@@ -206,6 +384,7 @@ def latest_with_health() -> dict[str, Any]:
         "error": runtime["last_error"] if not connected else None,
         "actuators": runtime["actuators"],
         "simulation": SIMULATION,
+        "mqtt_mode": MQTT_MODE,
     }
 
 
@@ -225,6 +404,8 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
     actuator = item.get("actuator")
     if not actuator:
         return "reviewed", "No actuator command was attached"
+    if MQTT_MODE == "subscribe":
+        raise HTTPException(409, "Remote MQTT dashboard is read-only")
     if actuator not in ACTUATORS:
         raise HTTPException(400, "Unknown actuator")
     if actuator in ("ec", "ph") and not CHEMICAL_CONTROL_ENABLED:
@@ -482,7 +663,14 @@ async def lifespan(_app: FastAPI):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     store.initialize()
     stop_event.clear()
-    worker = threading.Thread(target=simulation_worker if SIMULATION else serial_worker, daemon=True)
+    start_mqtt_transport()
+    if SIMULATION:
+        worker_target = simulation_worker
+    elif MQTT_MODE == "subscribe":
+        worker_target = mqtt_wait_worker
+    else:
+        worker_target = serial_worker
+    worker = threading.Thread(target=worker_target, daemon=True)
     worker.start()
     if AUTOMATION_ENABLED:
         scheduler = BackgroundScheduler(timezone="Asia/Seoul")
@@ -493,6 +681,7 @@ async def lifespan(_app: FastAPI):
     stop_event.set()
     if scheduler:
         scheduler.shutdown(wait=False)
+    stop_mqtt_transport()
     worker.join(timeout=2)
 
 
@@ -504,8 +693,12 @@ def health() -> dict[str, Any]:
     latest = latest_with_health()
     return {
         "server": "online", "database": "online", "pico": "online" if latest["pico_connected"] else "offline",
-        "simulation": SIMULATION, "control_enabled": CONTROL_ENABLED,
-        "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED,
+        "simulation": SIMULATION,
+        "control_enabled": CONTROL_ENABLED and MQTT_MODE != "subscribe",
+        "mqtt_mode": MQTT_MODE,
+        "mqtt_connected": bool(runtime_state["mqtt_connected"]),
+        "mqtt_error": runtime_state["mqtt_error"],
+        "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED and MQTT_MODE != "subscribe",
         "automation_enabled": AUTOMATION_ENABLED, "configured_model": OPENAI_MODEL,
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
         "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
@@ -528,7 +721,8 @@ def sensor_history(hours: int = Query(24, ge=1, le=720)) -> list[dict[str, Any]]
 def actuators() -> dict[str, Any]:
     with state_lock:
         states = dict(runtime_state["actuators"])
-    return {"control_enabled": CONTROL_ENABLED, "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED,
+    return {"control_enabled": CONTROL_ENABLED and MQTT_MODE != "subscribe",
+            "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED and MQTT_MODE != "subscribe",
             "items": [{"id": key, "state": states.get(key, "unknown"), **value} for key, value in ACTUATORS.items()]}
 
 
