@@ -15,7 +15,6 @@ import os
 import secrets
 import threading
 import time
-import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -23,10 +22,9 @@ from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import paho.mqtt.client as mqtt
 import requests
-import paho.mqtt.client as mqtt
 import serial
-import paho.mqtt.client as mqtt
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -50,7 +48,6 @@ CAPTURE_DIR = DATA_DIR / "captures"
 REPORT_DIR = DATA_DIR / "reports"
 DB_PATH = Path(os.getenv("SMARTFARM_DB_PATH", DATA_DIR / "smartfarm.db"))
 CONFIG_PATH = Path(os.getenv("SMARTFARM_SCHOOL_CONFIG", ROOT / "config.school.json"))
-HOME_CONFIG_PATH = Path(os.getenv("SMARTFARM_HOME_CONFIG", ROOT / "config.home.json"))
 
 SIMULATION = os.getenv("SMARTFARM_SIMULATION", "0") == "1"
 CONTROL_ENABLED = os.getenv("SMARTFARM_CONTROL_ENABLED", "0") == "1"
@@ -62,12 +59,9 @@ LED_SCHEDULE_HARDWARE_ENABLED = (
 MQTT_PUBLISH_ENABLED = os.getenv("SMARTFARM_MQTT_PUBLISH_ENABLED", "0") == "1"
 MQTT_SUBSCRIBE_ENABLED = os.getenv("SMARTFARM_MQTT_SUBSCRIBE_ENABLED", "0") == "1"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
-MQTT_MODE = os.getenv("SMARTFARM_MQTT_MODE", "off").strip().lower()
+MQTT_MODE = "subscribe" if MQTT_SUBSCRIBE_ENABLED else "publish" if MQTT_PUBLISH_ENABLED else "off"
 SENSOR_STALE_SECONDS = 20
 SEOUL = ZoneInfo("Asia/Seoul")
-
-if MQTT_MODE not in ("off", "publish", "subscribe"):
-    raise ValueError("SMARTFARM_MQTT_MODE must be off, publish or subscribe")
 
 ACTUATORS = {
     "led": {"label": "LED", "max_seconds": 57600},
@@ -88,9 +82,6 @@ serial_connection: serial.Serial | None = None
 mqtt_connection: mqtt.Client | None = None
 mqtt_sequence = 0
 scheduler: BackgroundScheduler | None = None
-mqtt_client: mqtt.Client | None = None
-mqtt_config: dict[str, Any] | None = None
-mqtt_sequence = 0
 
 runtime_state: dict[str, Any] = {
     "pico_connected": False,
@@ -277,7 +268,13 @@ def on_mqtt_disconnect(
     properties: Any = None,
 ) -> None:
     del client, userdata, disconnect_flags, properties
-    update_runtime(mqtt_connected=False, mqtt_error=f"MQTT disconnected: {reason_code}")
+    values: dict[str, Any] = {
+        "mqtt_connected": False,
+        "mqtt_error": f"MQTT disconnected: {reason_code}",
+    }
+    if MQTT_SUBSCRIBE_ENABLED:
+        values.update(pico_connected=False, last_error="MQTT connection lost")
+    update_runtime(**values)
 
 
 def on_mqtt_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
@@ -315,7 +312,10 @@ def start_mqtt() -> None:
     if MQTT_SUBSCRIBE_ENABLED:
         client.on_message = on_mqtt_message
     mqtt_connection = client
-    update_runtime(mqtt_topic=config["telemetry_topic"])
+    values: dict[str, Any] = {"mqtt_topic": config["telemetry_topic"]}
+    if MQTT_SUBSCRIBE_ENABLED:
+        values.update(port="MQTT", last_error="Waiting for school MQTT telemetry")
+    update_runtime(**values)
     client.connect_async(config["mqtt_broker"], config["mqtt_port"], keepalive=60)
     client.loop_start()
 
@@ -560,11 +560,6 @@ def simulation_worker() -> None:
         update_runtime(updated_at_epoch=time.time())
 
 
-def mqtt_wait_worker() -> None:
-    update_runtime(port="MQTT", last_error="Waiting for school MQTT telemetry")
-    stop_event.wait()
-
-
 def latest_with_health() -> dict[str, Any]:
     latest = store.latest_sensor() or {}
     if latest:
@@ -607,6 +602,7 @@ def latest_with_health() -> dict[str, Any]:
         "error": runtime["last_error"],
         "actuators": runtime["actuators"],
         "simulation": SIMULATION,
+        "mqtt_mode": MQTT_MODE,
         "sensor_errors": sensor_errors,
         "aht10_connected": aht10_connected,
         "scd40_connected": scd40_connected,
@@ -636,7 +632,7 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
     actuator = item.get("actuator")
     if not actuator:
         return "reviewed", "No actuator command was attached"
-    if MQTT_MODE == "subscribe":
+    if MQTT_SUBSCRIBE_ENABLED:
         raise HTTPException(409, "Remote MQTT dashboard is read-only")
     if actuator not in ACTUATORS:
         raise HTTPException(400, "Unknown actuator")
@@ -979,11 +975,11 @@ def health() -> dict[str, Any]:
     return {
         "server": "online", "database": "online", "pico": "online" if latest["pico_connected"] else "offline",
         "simulation": SIMULATION,
-        "control_enabled": CONTROL_ENABLED and MQTT_MODE != "subscribe",
+        "control_enabled": CONTROL_ENABLED and not MQTT_SUBSCRIBE_ENABLED,
         "mqtt_mode": MQTT_MODE,
         "mqtt_connected": bool(runtime_state["mqtt_connected"]),
         "mqtt_error": runtime_state["mqtt_error"],
-        "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED and MQTT_MODE != "subscribe",
+        "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED and not MQTT_SUBSCRIBE_ENABLED,
         "automation_enabled": AUTOMATION_ENABLED, "configured_model": OPENAI_MODEL,
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
         "led_schedule_hardware_enabled": LED_SCHEDULE_HARDWARE_ENABLED,
@@ -1078,13 +1074,15 @@ def sensor_history(hours: int = Query(24, ge=1, le=720)) -> list[dict[str, Any]]
 def actuators() -> dict[str, Any]:
     with state_lock:
         states = dict(runtime_state["actuators"])
-    return {"control_enabled": CONTROL_ENABLED and MQTT_MODE != "subscribe",
-            "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED and MQTT_MODE != "subscribe",
+    return {"control_enabled": CONTROL_ENABLED and not MQTT_SUBSCRIBE_ENABLED,
+            "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED and not MQTT_SUBSCRIBE_ENABLED,
             "items": [{"id": key, "state": states.get(key, "unknown"), **value} for key, value in ACTUATORS.items()]}
 
 
 @app.post("/api/actuators/{actuator}/request", dependencies=[Depends(require_auth)])
 def request_actuator(actuator: str, request: ManualRequest) -> dict[str, Any]:
+    if MQTT_SUBSCRIBE_ENABLED:
+        raise HTTPException(409, "Remote MQTT dashboard is read-only")
     if actuator not in ACTUATORS:
         raise HTTPException(404, "Unknown actuator")
     if request.state == "on" and not 0 < request.duration_seconds <= ACTUATORS[actuator]["max_seconds"]:

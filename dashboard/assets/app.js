@@ -86,6 +86,7 @@ function showPage(id){document.querySelectorAll('.page').forEach(page=>page.clas
 
 function applyLatest(data){
   const online=Boolean(data.pico_connected);
+  const remote=data.mqtt_mode==='subscribe'||data.port==='MQTT';
   const aht10Online=Boolean(data.aht10_connected);
   const scd40Online=Boolean(data.scd40_connected);
   const pe350Online=Boolean(data.pe350_connected);
@@ -94,11 +95,11 @@ function applyLatest(data){
   const partial=online&&liveCount<3;
   const errors=data.sensor_errors||{};
   const airTemp=aht10Online?data.air_temp:null,humidity=aht10Online?data.humidity:null,co2=scd40Online?data.co2:null,ec=pe350Online?data.ec:null,ph=pe350Online?data.ph:null,solutionTemp=pe350Online?data.solution_temp:null;
-  $('sensorTopState').textContent=!online?'PICO USB · OFFLINE':data.simulation?'SIMULATION · LIVE':noSensors?'PICO USB · NO SENSOR':partial?'PICO USB · PARTIAL':'PICO USB · LIVE';
+  $('sensorTopState').textContent=!online?(remote?'MQTT · OFFLINE':'PICO USB · OFFLINE'):data.simulation?'SIMULATION · LIVE':remote?(partial?'MQTT · PARTIAL':'MQTT · LIVE'):noSensors?'PICO USB · NO SENSOR':partial?'PICO USB · PARTIAL':'PICO USB · LIVE';
   $('sidebarSensorState').textContent=!online?'센서 연결 확인 필요':partial?`${liveCount}/3 센서군 실측 중`:'센서 수집 정상';
   $('sidebarSensorDetail').textContent=online?`${data.port} · ${fmt(data.age_seconds,1)}초 전`:(data.error||'데이터 없음');
-  $('sensorBannerTitle').textContent=!online?'Pico 통합 데이터를 받지 못했습니다.':noSensors?'Pico는 연결됐지만 유효한 센서값이 없습니다.':partial?'정상 센서의 부분 실측값을 수신하고 있습니다.':'통합 센서 데이터를 수신하고 있습니다.';
-  $('sensorBannerText').textContent=!online?(data.error||'USB와 실행 파일을 확인하세요.'):partial?(data.error||'일부 센서를 점검하세요.'):'AHT10·SCD40·PE350 값이 SQLite에 자동 저장됩니다.';
+  $('sensorBannerTitle').textContent=!online?(remote?'학교 MQTT 실측 데이터를 받지 못했습니다.':'Pico 통합 데이터를 받지 못했습니다.'):noSensors?(remote?'MQTT 메시지에 유효한 센서값이 없습니다.':'Pico는 연결됐지만 유효한 센서값이 없습니다.'):partial?'정상 센서의 부분 실측값을 수신하고 있습니다.':remote?'학교 MQTT 실측 데이터를 수신하고 있습니다.':'통합 센서 데이터를 수신하고 있습니다.';
+  $('sensorBannerText').textContent=!online?(data.error||(remote?'학교 서버와 MQTT 설정을 확인하세요.':'USB와 실행 파일을 확인하세요.')):partial?(data.error||'일부 센서를 점검하세요.'):'AHT10·SCD40·PE350 값이 SQLite에 자동 저장됩니다.';
   const source=sourceClass(data.source);const sourceText=data.source?sourceLabel(data.source):'실측 데이터 대기';
   $('dataSourceBadge').textContent=sourceText;$('tempFoot').className=`data-note ${source}`;$('humidFoot').className=`data-note ${source}`;$('co2Foot').className=`data-note ${source}`;$('ecFoot').className=`data-note ${source}`;$('phFoot').className=`data-note ${source}`;
   $('tempFoot').textContent=aht10Online?`${sourceText} · AHT10`:`AHT10 · ${errors.aht10||'연결 대기'}`;$('humidFoot').textContent=aht10Online?`${sourceText} · AHT10`:`AHT10 · ${errors.aht10||'연결 대기'}`;$('co2Foot').textContent=scd40Online?`${sourceText} · SCD40`:`SCD40 · ${errors.scd40||'연결 대기'}`;$('ecFoot').textContent=pe350Online?`${sourceText} · PE350`:`PE350 · ${errors.pe350||'연결 대기'}`;$('phFoot').textContent=pe350Online?`${sourceText} · PE350`:`PE350 · ${errors.pe350||'연결 대기'}`;

@@ -94,7 +94,7 @@ TLS와 계정 인증을 제공하는 전용 브로커로 교체해야 합니다.
 powershell -ExecutionPolicy Bypass -File school_server\run_smartfarm_dashboard.ps1
 ```
 
-이 실행 스크립트는 `SMARTFARM_MQTT_MODE=publish`를 적용하므로 통합 센서값을 `config.school.json`의 telemetry topic으로 발행합니다. 별도의 `pe350_mqtt_bridge.py`를 동시에 실행하면 COM 포트가 충돌하므로 실행하지 않습니다.
+학교 서버의 `.env`에서 `SMARTFARM_MQTT_PUBLISH_ENABLED=1`로 설정하면 통합 센서값을 `config.school.json`의 telemetry topic으로 발행합니다. 별도의 `pe350_mqtt_bridge.py`를 동시에 실행하면 COM 포트가 충돌하므로 실행하지 않습니다.
 
 ## 외부 Wi-Fi의 게이밍 노트북
 
