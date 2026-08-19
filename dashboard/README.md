@@ -45,9 +45,16 @@ powershell -ExecutionPolicy Bypass -File school_server\run_smartfarm_dashboard.p
 ```dotenv
 SMARTFARM_SIMULATION=0
 SMARTFARM_AUTOMATION_ENABLED=1
+SMARTFARM_PICO_UPLOAD_ENABLED=0
 SMARTFARM_CONTROL_ENABLED=0
 SMARTFARM_CHEMICAL_CONTROL_ENABLED=0
 ```
+
+`SMARTFARM_PICO_UPLOAD_ENABLED=1`은 액추에이터 전원을 분리하고 Pico
+런타임 파일을 갱신할 때만 일시적으로 사용합니다. 평상시 서버 실행에서는
+`0`으로 유지합니다. Pico의 `ACTUATOR_OUTPUTS_ARMED`도 기본적으로 `False`라서
+서버와 장치 양쪽 안전장치를 모두 명시적으로 해제하기 전에는 ON 출력이
+거부됩니다.
 
 실물 제어 활성화는 비상정지, 릴레이 자동 OFF, 각 액추에이터 단독 시험, USB 끊김 재시험을 마친 뒤 마지막에 진행합니다.
 

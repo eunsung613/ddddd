@@ -1,6 +1,6 @@
 """Pico 2 W integrated telemetry and relay runtime.
 
-The school laptop starts this file over USB serial. Relays are active LOW and
+The school laptop starts this file over USB serial. Relays are active HIGH and
 are forced OFF at boot. PE350 access remains read-only (Modbus function 0x04).
 """
 
@@ -20,7 +20,12 @@ except ImportError:
     import select
 
 import config
-from smartfarm_pins import RELAY_OFF, RELAY_ON, RELAY_PINS
+from smartfarm_pins import (
+    ACTUATOR_OUTPUTS_ARMED,
+    RELAY_OFF,
+    RELAY_ON,
+    RELAY_PINS,
+)
 from sensors.pe350 import (
     PE350Modbus,
     ec_us_cm_to_ds_m,
@@ -122,6 +127,8 @@ def set_relay(name, turn_on, duration_seconds=0):
     if name not in relays:
         raise ValueError("Unknown actuator: " + str(name))
     if turn_on:
+        if not ACTUATOR_OUTPUTS_ARMED:
+            raise RuntimeError("Pico actuator outputs are not armed")
         duration_seconds = int(duration_seconds)
         if duration_seconds <= 0 or duration_seconds > MAX_ON_SECONDS[name]:
             raise ValueError("Invalid duration for " + name)
@@ -199,7 +206,11 @@ def read_telemetry(environment, pe350):
 
 def main():
     all_off()
-    emit("RUNTIME_JSON:", {"status": "starting", "relays": "all_off"})
+    emit("RUNTIME_JSON:", {
+        "status": "starting",
+        "relays": "all_off",
+        "actuator_outputs_armed": ACTUATOR_OUTPUTS_ARMED,
+    })
     environment = EnvironmentSensors()
     pe350 = PE350Modbus()
     poll = select.poll()
