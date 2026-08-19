@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -107,6 +108,18 @@ class OpenAISettingsRequest(BaseModel):
     model: str = Field(min_length=2, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
 
 
+class CameraSettingsItem(BaseModel):
+    slot: int = Field(ge=1, le=4)
+    label: str = Field(default="", max_length=80)
+    snapshot_url: str = Field(default="", max_length=500)
+    username: str = Field(default="", max_length=100)
+    password: str | None = Field(default=None, max_length=200)
+
+
+class CameraSettingsRequest(BaseModel):
+    cameras: list[CameraSettingsItem] = Field(min_length=1, max_length=4)
+
+
 class LedScheduleRequest(BaseModel):
     enabled: bool
     on_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
@@ -148,6 +161,12 @@ def update_runtime(**values: Any) -> None:
         runtime_state.update(values)
 
 
+def env_file_value(value: str) -> str:
+    if any(character in value for character in " #\t\"'"):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
 def update_env_file(values: dict[str, str]) -> None:
     """Persist server-only settings without returning secrets to the browser."""
     env_path = ROOT / ".env"
@@ -157,12 +176,12 @@ def update_env_file(values: dict[str, str]) -> None:
     for line in lines:
         key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
         if key in remaining:
-            updated.append(f"{key}={remaining.pop(key)}")
+            updated.append(f"{key}={env_file_value(remaining.pop(key))}")
         else:
             updated.append(line)
     if remaining and updated and updated[-1] != "":
         updated.append("")
-    updated.extend(f"{key}={value}" for key, value in remaining.items())
+    updated.extend(f"{key}={env_file_value(value)}" for key, value in remaining.items())
     temporary = env_path.with_name(".env.tmp")
     temporary.write_text("\n".join(updated) + "\n", encoding="utf-8")
     temporary.replace(env_path)
@@ -447,11 +466,45 @@ def camera_configs() -> list[dict[str, str]]:
         url = os.getenv(f"CAMERA_{number}_SNAPSHOT_URL", "").strip()
         if url:
             cameras.append({
-                "id": f"CAM-{number:02d}", "url": url,
+                "id": f"CAM-{number:02d}", "slot": number, "url": url,
+                "label": os.getenv(f"CAMERA_{number}_LABEL", "").strip() or f"카메라 {number}",
                 "username": os.getenv(f"CAMERA_{number}_USERNAME", ""),
                 "password": os.getenv(f"CAMERA_{number}_PASSWORD", ""),
             })
     return cameras
+
+
+def public_camera_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return url.split("@")[-1]
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def camera_settings_payload() -> dict[str, Any]:
+    configured = {int(item["slot"]): item for item in camera_configs()}
+    slots = []
+    for number in range(1, 5):
+        item = configured.get(number)
+        slots.append({
+            "slot": number,
+            "id": f"CAM-{number:02d}",
+            "label": item["label"] if item else os.getenv(f"CAMERA_{number}_LABEL", "").strip() or f"카메라 {number}",
+            "snapshot_url": public_camera_url(item["url"]) if item else "",
+            "username": item["username"] if item else os.getenv(f"CAMERA_{number}_USERNAME", ""),
+            "password_saved": bool(os.getenv(f"CAMERA_{number}_PASSWORD", "")),
+            "configured": item is not None,
+        })
+    return {
+        "configured": [
+            {"id": item["id"], "slot": item["slot"], "label": item["label"], "url": public_camera_url(item["url"])}
+            for item in configured.values()
+        ],
+        "slots": slots,
+        "captures": store.captures(),
+    }
 
 
 def capture_cameras() -> list[dict[str, Any]]:
@@ -471,12 +524,14 @@ def capture_cameras() -> list[dict[str, Any]]:
                 raise ValueError("Camera response is not JPEG")
             path.write_bytes(response.content)
             capture_id = store.add_capture(camera["id"], str(path), "success", None)
-            results.append({"id": capture_id, "camera_id": camera["id"], "status": "success"})
+            results.append({"id": capture_id, "camera_id": camera["id"], "label": camera["label"], "status": "success"})
         except (requests.RequestException, OSError, ValueError) as error:
             capture_id = store.add_capture(camera["id"], None, "failed", str(error))
-            results.append({"id": capture_id, "camera_id": camera["id"], "status": "failed", "error": str(error)})
+            results.append({"id": capture_id, "camera_id": camera["id"], "label": camera["label"], "status": "failed", "error": str(error)})
+    successes = sum(item["status"] == "success" for item in results)
+    workflow_status = "skipped" if not cameras else "success" if successes == len(cameras) else "partial" if successes else "failed"
     store.workflow(
-        "camera_capture", "success" if cameras else "skipped",
+        "camera_capture", workflow_status,
         json.dumps(results, ensure_ascii=False) if cameras else "No camera is configured",
     )
     return results
@@ -842,8 +897,40 @@ def decide(recommendation_id: int, request: DecisionRequest) -> dict[str, Any]:
 
 @app.get("/api/cameras", dependencies=[Depends(require_auth)])
 def cameras() -> dict[str, Any]:
-    return {"configured": [{"id": item["id"], "url": item["url"].split("@")[-1]} for item in camera_configs()],
-            "captures": store.captures()}
+    return camera_settings_payload()
+
+
+@app.put(
+    "/api/settings/cameras",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def save_camera_settings(request: CameraSettingsRequest) -> dict[str, Any]:
+    slots = [item.slot for item in request.cameras]
+    if len(slots) != len(set(slots)):
+        raise HTTPException(400, "Camera slots must be unique")
+    values: dict[str, str] = {}
+    for item in request.cameras:
+        label = item.label.strip() or f"카메라 {item.slot}"
+        url = item.snapshot_url.strip()
+        username = item.username.strip()
+        for value in (label, url, username, item.password or ""):
+            if "\n" in value or "\r" in value:
+                raise HTTPException(400, "Camera settings cannot contain line breaks")
+        if url:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise HTTPException(400, f"CAM-{item.slot:02d} snapshot URL must use http or https")
+            if parsed.username or parsed.password:
+                raise HTTPException(400, f"CAM-{item.slot:02d} credentials must use the separate account fields")
+        prefix = f"CAMERA_{item.slot}"
+        values[f"{prefix}_LABEL"] = label
+        values[f"{prefix}_SNAPSHOT_URL"] = url
+        values[f"{prefix}_USERNAME"] = username
+        password = item.password or ""
+        if password or not url:
+            values[f"{prefix}_PASSWORD"] = password
+    update_env_file(values)
+    return camera_settings_payload()
 
 
 @app.post("/api/cameras/capture", dependencies=[Depends(require_auth)])
