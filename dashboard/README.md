@@ -19,7 +19,7 @@
 - AI는 릴레이 명령을 직접 전송하지 않습니다. 현재 자동 장치 제안은 고정 임계값 규칙이 만들고 사람이 최종 승인합니다.
 - 센서 데이터가 20초 이상 지연되면 실물 제어를 차단합니다.
 
-## 게이밍 노트북에서 안전하게 확인
+## 게이밍 노트북에서 모의 화면 확인
 
 ```powershell
 py -m pip install -r requirements.txt
@@ -27,6 +27,58 @@ powershell -ExecutionPolicy Bypass -File school_server\run_dashboard_demo.ps1
 ```
 
 브라우저에서 `http://127.0.0.1:8765`를 엽니다. 모든 센서값은 `모의 데이터`로 표시되고 하드웨어 명령은 차단됩니다.
+
+## 서로 다른 Wi-Fi에서 MQTT로 실측 센서 보기
+
+학교 서버는 통합 대시보드가 COM 포트를 계속 소유한 채, 이미 수집한 센서값만
+MQTT에 발행합니다. 별도 USB 브리지를 동시에 실행하지 않습니다. MQTT 메시지에는
+카메라 사진·비밀번호·액추에이터 명령을 넣지 않으며 `cmd` 토픽도 구독하지 않습니다.
+
+학교 서버 `.env`:
+
+```dotenv
+SMARTFARM_SIMULATION=0
+SMARTFARM_MQTT_PUBLISH_ENABLED=1
+SMARTFARM_MQTT_SUBSCRIBE_ENABLED=0
+SMARTFARM_MQTT_CONFIG=config.school.json
+```
+
+게이밍 노트북에서는 저장소를 받은 뒤 다음을 준비합니다.
+
+```powershell
+git pull
+py -m pip install -r requirements.txt
+Copy-Item config.home.example.json config.home.json
+Copy-Item .env.example .env
+```
+
+게이밍 노트북 `.env`:
+
+```dotenv
+SMARTFARM_SIMULATION=0
+SMARTFARM_AUTOMATION_ENABLED=0
+SMARTFARM_CONTROL_ENABLED=0
+SMARTFARM_CHEMICAL_CONTROL_ENABLED=0
+SMARTFARM_LED_SCHEDULE_HARDWARE_ENABLED=0
+SMARTFARM_MQTT_PUBLISH_ENABLED=0
+SMARTFARM_MQTT_SUBSCRIBE_ENABLED=1
+SMARTFARM_MQTT_CONFIG=config.home.json
+```
+
+`config.home.json`의 broker와 `topics.telemetry`가 학교 서버의
+`config.school.json`과 같아야 합니다. 그 다음 게이밍 노트북에서 실행합니다.
+
+```powershell
+py -m dashboard.server
+```
+
+브라우저에서 `http://127.0.0.1:8765`를 열면 MQTT로 받은 실측값과, 게이밍
+노트북에서 수신을 시작한 뒤 누적된 그래프를 볼 수 있습니다. 서버 카메라 사진과
+과거 SQLite 자료는 MQTT 센서 토픽에 포함되지 않습니다.
+
+현재 예시의 `broker.hivemq.com:1883`은 인증 없는 공개 시험 브로커입니다.
+조회 시험에만 사용하고 펌프·릴레이 제어에는 사용하지 않습니다. 운영 전에는
+TLS와 계정 인증을 제공하는 전용 브로커로 교체해야 합니다.
 
 ## 학교 서버 노트북에서 실행
 
@@ -50,6 +102,9 @@ SMARTFARM_PICO_UPLOAD_ENABLED=0
 SMARTFARM_CONTROL_ENABLED=0
 SMARTFARM_CHEMICAL_CONTROL_ENABLED=0
 SMARTFARM_LED_SCHEDULE_HARDWARE_ENABLED=0
+SMARTFARM_MQTT_PUBLISH_ENABLED=1
+SMARTFARM_MQTT_SUBSCRIBE_ENABLED=0
+SMARTFARM_MQTT_CONFIG=config.school.json
 ```
 
 `SMARTFARM_PICO_UPLOAD_ENABLED=1`은 액추에이터 전원을 분리하고 Pico
