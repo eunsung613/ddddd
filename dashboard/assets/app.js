@@ -82,21 +82,27 @@ function bindNavigation(){
 function showPage(id){document.querySelectorAll('.page').forEach(page=>page.classList.toggle('on',page.id===id));document.querySelectorAll('[data-page]').forEach(button=>button.classList.toggle('on',button.dataset.page===id));$('crumbName').textContent=titles[id];if(id==='overview'||id==='analytics')requestAnimationFrame(drawCharts);window.scrollTo({top:0,behavior:'smooth'});}
 
 function applyLatest(data){
-  const online=data.pico_connected;
-  $('sensorTopState').textContent=online?(data.simulation?'SIMULATION · LIVE':'PICO USB · LIVE'):'PICO USB · OFFLINE';
-  $('sidebarSensorState').textContent=online?'센서 수집 정상':'센서 연결 확인 필요';
+  const online=Boolean(data.pico_connected);
+  const aht10Online=Boolean(data.aht10_connected);
+  const scd40Online=Boolean(data.scd40_connected);
+  const pe350Online=Boolean(data.pe350_connected);
+  const liveCount=[aht10Online,scd40Online,pe350Online].filter(Boolean).length;
+  const partial=online&&liveCount>0&&liveCount<3;
+  const errors=data.sensor_errors||{};
+  $('sensorTopState').textContent=!online?'PICO USB · OFFLINE':data.simulation?'SIMULATION · LIVE':partial?'PICO USB · PARTIAL':'PICO USB · LIVE';
+  $('sidebarSensorState').textContent=!online?'센서 연결 확인 필요':partial?`${liveCount}/3 센서군 실측 중`:'센서 수집 정상';
   $('sidebarSensorDetail').textContent=online?`${data.port} · ${fmt(data.age_seconds,1)}초 전`:(data.error||'데이터 없음');
-  $('sensorBannerTitle').textContent=online?'통합 센서 데이터를 수신하고 있습니다.':'Pico 통합 데이터를 받지 못했습니다.';
-  $('sensorBannerText').textContent=online?'AHT10·SCD40·PE350 값이 SQLite에 자동 저장됩니다.':(data.error||'USB와 실행 파일을 확인하세요.');
-  const source=sourceClass(data.source);const sourceText=sourceLabel(data.source);
+  $('sensorBannerTitle').textContent=!online?'Pico 통합 데이터를 받지 못했습니다.':partial?'정상 센서의 부분 실측값을 수신하고 있습니다.':'통합 센서 데이터를 수신하고 있습니다.';
+  $('sensorBannerText').textContent=!online?(data.error||'USB와 실행 파일을 확인하세요.'):partial?(data.error||'일부 센서를 점검하세요.'):'AHT10·SCD40·PE350 값이 SQLite에 자동 저장됩니다.';
+  const source=sourceClass(data.source);const sourceText=data.source?sourceLabel(data.source):'실측 데이터 대기';
   $('dataSourceBadge').textContent=sourceText;$('tempFoot').className=`data-note ${source}`;$('humidFoot').className=`data-note ${source}`;$('co2Foot').className=`data-note ${source}`;$('ecFoot').className=`data-note ${source}`;$('phFoot').className=`data-note ${source}`;
-  $('tempFoot').textContent=`${sourceText} · AHT10`;$('humidFoot').textContent=`${sourceText} · AHT10`;$('co2Foot').textContent=`${sourceText} · SCD40`;$('ecFoot').textContent=`${sourceText} · PE350`;$('phFoot').textContent=`${sourceText} · PE350`;
+  $('tempFoot').textContent=aht10Online?`${sourceText} · AHT10`:`AHT10 · ${errors.aht10||'연결 대기'}`;$('humidFoot').textContent=aht10Online?`${sourceText} · AHT10`:`AHT10 · ${errors.aht10||'연결 대기'}`;$('co2Foot').textContent=scd40Online?`${sourceText} · SCD40`:`SCD40 · ${errors.scd40||'연결 대기'}`;$('ecFoot').textContent=pe350Online?`${sourceText} · PE350`:`PE350 · ${errors.pe350||'연결 대기'}`;$('phFoot').textContent=pe350Online?`${sourceText} · PE350`:`PE350 · ${errors.pe350||'연결 대기'}`;
   $('tempValue').innerHTML=`${fmt(data.air_temp,1)}<small>°C</small>`;$('humidValue').innerHTML=`${fmt(data.humidity,1)}<small>%</small>`;$('co2Value').innerHTML=`${fmt(data.co2,0)}<small>ppm</small>`;$('ecValue').innerHTML=`${fmt(data.ec,3)}<small>dS/m</small>`;$('phValue').textContent=fmt(data.ph,2);$('solutionTempValue').innerHTML=`${fmt(data.solution_temp,1)}<small>°C</small>`;
-  $('pe350Status').textContent=data.ec!==null&&data.ec!==undefined?'LIVE':'MISSING';$('pe350Status').className=`tag ${data.ec!==null&&data.ec!==undefined?'green':'amber'}`;
-  $('lastSensorAge').textContent=data.age_seconds===null?'--':`${fmt(data.age_seconds,1)}초`;$('dataQuality').textContent=online?'LIVE':'OFF';$('dataQualityFoot').textContent=data.recorded_at?timeText(data.recorded_at):'기록 없음';
+  $('pe350Status').textContent=pe350Online?'LIVE':'OFFLINE';$('pe350Status').className=`tag ${pe350Online?'green':'amber'}`;
+  $('lastSensorAge').textContent=data.age_seconds===null?'--':`${fmt(data.age_seconds,1)}초`;$('dataQuality').textContent=online?`${liveCount}/3`:'OFF';$('dataQualityFoot').textContent=data.recorded_at?timeText(data.recorded_at):'기록 없음';
   const checks=[[data.air_temp,18,25],[data.humidity,60,80],[data.ec,1.5,2],[data.ph,5.5,6.5]];const available=checks.filter(x=>x[0]!==null&&x[0]!==undefined);const normal=available.filter(([value,low,high])=>Number(value)>=low&&Number(value)<=high).length;const score=available.length?Math.round(normal/available.length*100):0;const warning=available.length&&normal<available.length;
   $('scoreNumber').textContent=available.length?score:'--';$('scoreMood').textContent=!available.length?'판정 불가':warning?'확인 필요':'기준 내';$('scoreMascot').className=`broc-emoji ${!available.length?'broc-confused':warning?'broc-sick':'broc-happy'} score-mascot`;$('scoreRing').style.background=`conic-gradient(${warning?'var(--amber)':'var(--green)'} 0 ${score}%,#dce9e4 ${score}%)`;
-  $('overallTag').textContent=!available.length?'판단 불가':warning?'주의':'정상';$('overallTag').className=`tag ${warning?'amber':'green'}`;$('overallTitle').textContent=!available.length?'센서 근거가 부족합니다':warning?'관리 기준을 벗어난 항목이 있습니다':'수집된 환경값이 관리 기준 안에 있습니다';$('overallText').textContent='이 판정은 고정 임계값 비교이며 AI 진단과 구분됩니다.';
+  $('overallTag').textContent=!available.length?'판단 불가':warning?'주의':partial?'부분 실측':'정상';$('overallTag').className=`tag ${warning||partial?'amber':'green'}`;$('overallTitle').textContent=!available.length?'센서 근거가 부족합니다':warning?'관리 기준을 벗어난 항목이 있습니다':partial?'수집 가능한 센서값만으로 판정했습니다':'수집된 환경값이 관리 기준 안에 있습니다';$('overallText').textContent=`고정 임계값 비교 · 정상 수집 ${liveCount}/3 센서군 · AI 진단과 구분`;
 }
 
 function applyHealth(health){

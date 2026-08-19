@@ -78,6 +78,7 @@ runtime_state: dict[str, Any] = {
     "updated_at_epoch": None,
     "actuators": {name: "off" for name in ACTUATORS},
     "last_ack": None,
+    "sensor_errors": {},
 }
 
 
@@ -134,11 +135,15 @@ def process_serial_line(line: str) -> None:
     if line.startswith("TELEMETRY_JSON:"):
         payload = json.loads(line.split(":", 1)[1])
         store.add_sensor(payload, "measured:pico_usb")
+        sensor_errors = payload.get("sensor_errors") or {}
         update_runtime(
             pico_connected=True,
-            last_error=None,
+            last_error="; ".join(
+                f"{name}: {message}" for name, message in sensor_errors.items()
+            ) or None,
             updated_at_epoch=time.time(),
             actuators=payload.get("actuators", runtime_state["actuators"]),
+            sensor_errors=sensor_errors,
         )
     elif line.startswith("ACK_JSON:"):
         update_runtime(last_ack=json.loads(line.split(":", 1)[1]))
@@ -202,14 +207,47 @@ def latest_with_health() -> dict[str, Any]:
     epoch = runtime.get("updated_at_epoch")
     age = round(time.time() - epoch, 1) if epoch else None
     connected = bool(runtime["pico_connected"] and age is not None and age <= SENSOR_STALE_SECONDS)
+    sensor_errors = dict(runtime.get("sensor_errors") or {})
+    if latest.get("raw_json"):
+        try:
+            raw_payload = json.loads(latest["raw_json"])
+            sensor_errors = dict(raw_payload.get("sensor_errors") or sensor_errors)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    aht10_connected = bool(
+        connected and latest.get("air_temp") is not None and latest.get("humidity") is not None
+    )
+    scd40_connected = bool(connected and latest.get("co2") is not None)
+    pe350_connected = bool(
+        connected
+        and latest.get("ec") is not None
+        and latest.get("ph") is not None
+        and latest.get("solution_temp") is not None
+    )
+    sensor_control_ready = aht10_connected and scd40_connected and pe350_connected
+    i2c_errors = "; ".join(
+        f"{name}: {sensor_errors[name]}"
+        for name in ("aht10", "scd40")
+        if name in sensor_errors
+    ) or None
     return {
         **latest,
         "pico_connected": connected,
         "port": runtime["port"],
         "age_seconds": age,
-        "error": runtime["last_error"] if not connected else None,
+        "error": runtime["last_error"],
         "actuators": runtime["actuators"],
         "simulation": SIMULATION,
+        "sensor_errors": sensor_errors,
+        "aht10_connected": aht10_connected,
+        "scd40_connected": scd40_connected,
+        "pe350_connected": pe350_connected,
+        "sensor_control_ready": sensor_control_ready,
+        "i2c_connected": aht10_connected or scd40_connected,
+        "i2c_age_seconds": age,
+        "i2c_error": i2c_errors,
+        "pe350_age_seconds": age,
+        "pe350_error": sensor_errors.get("pe350"),
     }
 
 
@@ -240,8 +278,8 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
     if not CONTROL_ENABLED:
         return "simulated", "CONTROL_ENABLED=0; approval logged without hardware output"
     latest = latest_with_health()
-    if not latest["pico_connected"]:
-        raise HTTPException(409, "Pico data is offline or stale")
+    if not latest["sensor_control_ready"]:
+        raise HTTPException(409, "Required sensor evidence is incomplete or stale")
     command = {
         "cmd_id": secrets.token_hex(8), "action": "set", "actuator": actuator,
         "state": state, "duration_seconds": duration,
