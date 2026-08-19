@@ -22,6 +22,11 @@ def main():
         "device-side output lock",
     )
     assert_equal(
+        smartfarm_pins.LED_SCHEDULE_OUTPUT_ARMED,
+        True,
+        "LED-only schedule output permission",
+    )
+    assert_equal(
         smartfarm_pins.RELAY_PINS,
         {
             "led": 16,

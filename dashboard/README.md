@@ -14,6 +14,7 @@
 
 - `SMARTFARM_CONTROL_ENABLED=0`이 기본값이므로 승인해도 실제 GPIO 출력은 없습니다.
 - EC와 pH 정량펌프는 `SMARTFARM_CHEMICAL_CONTROL_ENABLED=1`을 별도로 설정해야 합니다.
+- LED 광주기는 AI와 분리된 고정 서울시간 스케줄이며 `SMARTFARM_LED_SCHEDULE_HARDWARE_ENABLED=1`일 때 LED만 명령할 수 있습니다.
 - Pico는 부팅할 때 모든 LOW 트리거 릴레이를 OFF로 만들고 장치별 최대 작동시간 후 자동 OFF합니다.
 - AI는 릴레이 명령을 직접 전송하지 않습니다. 현재 자동 장치 제안은 고정 임계값 규칙이 만들고 사람이 최종 승인합니다.
 - 센서 데이터가 20초 이상 지연되면 실물 제어를 차단합니다.
@@ -48,6 +49,7 @@ SMARTFARM_AUTOMATION_ENABLED=1
 SMARTFARM_PICO_UPLOAD_ENABLED=0
 SMARTFARM_CONTROL_ENABLED=0
 SMARTFARM_CHEMICAL_CONTROL_ENABLED=0
+SMARTFARM_LED_SCHEDULE_HARDWARE_ENABLED=0
 ```
 
 `SMARTFARM_PICO_UPLOAD_ENABLED=1`은 액추에이터 전원을 분리하고 Pico
@@ -57,6 +59,17 @@ SMARTFARM_CHEMICAL_CONTROL_ENABLED=0
 거부됩니다.
 
 실물 제어 활성화는 비상정지, 릴레이 자동 OFF, 각 액추에이터 단독 시험, USB 끊김 재시험을 마친 뒤 마지막에 진행합니다.
+
+LED 광주기만 사용할 때는 다른 제어 플래그를 `0`으로 유지하고
+`SMARTFARM_LED_SCHEDULE_HARDWARE_ENABLED=1`만 설정합니다. 대시보드 자동화
+센터에서 ON/OFF 시각과 활성 여부를 저장하면 서버가 서울시간 기준으로
+LED 상태를 맞춥니다. 광주기는 최대 16시간이며 비활성화하면 OFF 명령을
+보냅니다.
+
+OpenAI API 키는 시스템 화면에서 저장할 수 있습니다. 키는 브라우저로 다시
+반환되지 않고 서버 노트북의 `.env`에만 기록됩니다. 비밀 설정 및 LED 광주기
+변경 API는 서버 노트북의 로컬 접속에서만 허용합니다. 원격으로 사용할 때는
+반드시 로그인과 HTTPS/VPN을 먼저 적용합니다.
 
 ## 카메라
 

@@ -11,6 +11,10 @@ RELAY_OFF = 0
 # Both guards must be enabled before the Pico can energize an actuator.
 ACTUATOR_OUTPUTS_ARMED = False
 
+# LED photoperiod commands have a separate, narrow device-side permission.
+# This does not arm pumps, valves, mixers, or the fan.
+LED_SCHEDULE_OUTPUT_ARMED = True
+
 RELAY_PINS = {
     "led": 16,
     "raw_water": 17,

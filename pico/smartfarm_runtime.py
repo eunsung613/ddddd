@@ -22,6 +22,7 @@ except ImportError:
 import config
 from smartfarm_pins import (
     ACTUATOR_OUTPUTS_ARMED,
+    LED_SCHEDULE_OUTPUT_ARMED,
     RELAY_OFF,
     RELAY_ON,
     RELAY_PINS,
@@ -168,7 +169,12 @@ def set_relay(name, turn_on, duration_seconds=0):
     if name not in relays:
         raise ValueError("Unknown actuator: " + str(name))
     if turn_on:
-        if not ACTUATOR_OUTPUTS_ARMED:
+        output_armed = (
+            LED_SCHEDULE_OUTPUT_ARMED
+            if name == "led"
+            else ACTUATOR_OUTPUTS_ARMED
+        )
+        if not output_armed:
             raise RuntimeError("Pico actuator outputs are not armed")
         duration_seconds = int(duration_seconds)
         if duration_seconds <= 0 or duration_seconds > MAX_ON_SECONDS[name]:
@@ -255,6 +261,7 @@ def main():
         "status": "starting",
         "relays": "all_off",
         "actuator_outputs_armed": ACTUATOR_OUTPUTS_ARMED,
+        "led_schedule_output_armed": LED_SCHEDULE_OUTPUT_ARMED,
     })
     environment = EnvironmentSensors()
     pe350 = PE350Modbus()

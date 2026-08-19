@@ -16,15 +16,16 @@ import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 import serial
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -50,8 +51,12 @@ SIMULATION = os.getenv("SMARTFARM_SIMULATION", "0") == "1"
 CONTROL_ENABLED = os.getenv("SMARTFARM_CONTROL_ENABLED", "0") == "1"
 CHEMICAL_CONTROL_ENABLED = os.getenv("SMARTFARM_CHEMICAL_CONTROL_ENABLED", "0") == "1"
 AUTOMATION_ENABLED = os.getenv("SMARTFARM_AUTOMATION_ENABLED", "1") == "1"
+LED_SCHEDULE_HARDWARE_ENABLED = (
+    os.getenv("SMARTFARM_LED_SCHEDULE_HARDWARE_ENABLED", "0") == "1"
+)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
 SENSOR_STALE_SECONDS = 20
+SEOUL = ZoneInfo("Asia/Seoul")
 
 ACTUATORS = {
     "led": {"label": "LED", "max_seconds": 57600},
@@ -79,6 +84,8 @@ runtime_state: dict[str, Any] = {
     "actuators": {name: "off" for name in ACTUATORS},
     "last_ack": None,
     "sensor_errors": {},
+    "led_schedule_error": None,
+    "led_schedule_last_run": None,
 }
 
 
@@ -95,6 +102,17 @@ class DecisionRequest(BaseModel):
     note: str = Field(default="", max_length=300)
 
 
+class OpenAISettingsRequest(BaseModel):
+    api_key: str | None = Field(default=None, max_length=300)
+    model: str = Field(min_length=2, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
+
+
+class LedScheduleRequest(BaseModel):
+    enabled: bool
+    on_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    off_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
 def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -> None:
     username = os.getenv("DASHBOARD_USERNAME")
     password = os.getenv("DASHBOARD_PASSWORD")
@@ -107,6 +125,12 @@ def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -
     )
     if not valid:
         raise HTTPException(401, "Invalid login", headers={"WWW-Authenticate": "Basic"})
+
+
+def require_local_settings(request: Request) -> None:
+    host = request.client.host if request.client else None
+    if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        raise HTTPException(403, "Settings can only be changed on the server laptop")
 
 
 def load_serial_config() -> tuple[str, int]:
@@ -122,6 +146,128 @@ def load_serial_config() -> tuple[str, int]:
 def update_runtime(**values: Any) -> None:
     with state_lock:
         runtime_state.update(values)
+
+
+def update_env_file(values: dict[str, str]) -> None:
+    """Persist server-only settings without returning secrets to the browser."""
+    env_path = ROOT / ".env"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    remaining = dict(values)
+    updated: list[str] = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
+        if key in remaining:
+            updated.append(f"{key}={remaining.pop(key)}")
+        else:
+            updated.append(line)
+    if remaining and updated and updated[-1] != "":
+        updated.append("")
+    updated.extend(f"{key}={value}" for key, value in remaining.items())
+    temporary = env_path.with_name(".env.tmp")
+    temporary.write_text("\n".join(updated) + "\n", encoding="utf-8")
+    temporary.replace(env_path)
+    os.environ.update(values)
+
+
+def time_minutes(value: str) -> int:
+    hour, minute = (int(part) for part in value.split(":"))
+    return hour * 60 + minute
+
+
+def photoperiod_minutes(on_time: str, off_time: str) -> int:
+    duration = (time_minutes(off_time) - time_minutes(on_time)) % (24 * 60)
+    if duration == 0:
+        raise ValueError("LED on and off times must be different")
+    if duration > 16 * 60:
+        raise ValueError("LED photoperiod cannot exceed 16 hours")
+    return duration
+
+
+def led_should_be_on(on_time: str, off_time: str, now: datetime) -> bool:
+    current = now.hour * 60 + now.minute
+    on_minute = time_minutes(on_time)
+    off_minute = time_minutes(off_time)
+    if on_minute < off_minute:
+        return on_minute <= current < off_minute
+    return current >= on_minute or current < off_minute
+
+
+def led_seconds_until_off(off_time: str, now: datetime) -> int:
+    off_hour, off_minute = (int(part) for part in off_time.split(":"))
+    target = now.replace(hour=off_hour, minute=off_minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(1, min(16 * 60 * 60, int((target - now).total_seconds())))
+
+
+def led_schedule_config() -> dict[str, Any]:
+    enabled = store.setting("led_schedule_enabled", "0") == "1"
+    on_time = store.setting("led_schedule_on_time", "06:00") or "06:00"
+    off_time = store.setting("led_schedule_off_time", "22:00") or "22:00"
+    now = datetime.now(SEOUL)
+    with state_lock:
+        current_state = runtime_state["actuators"].get("led", "unknown")
+        last_error = runtime_state.get("led_schedule_error")
+        last_run = runtime_state.get("led_schedule_last_run")
+    return {
+        "enabled": enabled,
+        "on_time": on_time,
+        "off_time": off_time,
+        "timezone": "Asia/Seoul",
+        "photoperiod_hours": round(photoperiod_minutes(on_time, off_time) / 60, 2),
+        "desired_state": "on" if enabled and led_should_be_on(on_time, off_time, now) else "off",
+        "current_state": current_state,
+        "hardware_enabled": LED_SCHEDULE_HARDWARE_ENABLED,
+        "last_error": last_error,
+        "last_run": last_run,
+    }
+
+
+def reconcile_led_schedule(force: bool = False) -> dict[str, Any]:
+    config = led_schedule_config()
+    desired = config["desired_state"]
+    now = datetime.now(SEOUL)
+    if not LED_SCHEDULE_HARDWARE_ENABLED:
+        update_runtime(led_schedule_error="LED schedule hardware output is disabled")
+        return {**led_schedule_config(), "result": "blocked"}
+    with state_lock:
+        connected = bool(runtime_state["pico_connected"])
+        current = runtime_state["actuators"].get("led", "unknown")
+    if not connected:
+        update_runtime(led_schedule_error="Pico USB is offline")
+        return {**led_schedule_config(), "result": "offline"}
+    if current == desired and not force:
+        update_runtime(led_schedule_error=None)
+        return {**config, "result": "unchanged"}
+    duration = led_seconds_until_off(config["off_time"], now) if desired == "on" else 0
+    command_id = secrets.token_hex(8)
+    command = {
+        "cmd_id": command_id,
+        "action": "set",
+        "actuator": "led",
+        "state": desired,
+        "duration_seconds": duration,
+    }
+    try:
+        send_pico_command(command)
+        timestamp = now.isoformat(timespec="seconds")
+        update_runtime(led_schedule_error=None, led_schedule_last_run=timestamp)
+        store.add_event({
+            "command_id": command_id,
+            "actuator": "led",
+            "requested_state": desired,
+            "duration_seconds": duration,
+            "source": "fixed_led_schedule",
+            "result": "sent",
+            "note": f"{config['on_time']}-{config['off_time']} Asia/Seoul",
+        })
+        store.workflow("led_photoperiod", "success", f"LED {desired}; {config['on_time']}-{config['off_time']}")
+        return {**led_schedule_config(), "result": "sent"}
+    except (RuntimeError, serial.SerialException, OSError) as error:
+        message = str(error)
+        update_runtime(led_schedule_error=message)
+        store.workflow("led_photoperiod", "failed", message)
+        return {**led_schedule_config(), "result": "failed"}
 
 
 def start_pico_runtime(pico: serial.Serial) -> None:
@@ -154,26 +300,28 @@ def process_serial_line(line: str) -> None:
 
 def serial_worker() -> None:
     global serial_connection
-    try:
-        port, baudrate = load_serial_config()
-        with serial.Serial(port, baudrate, timeout=1) as pico:
+    while not stop_event.is_set():
+        try:
+            port, baudrate = load_serial_config()
+            with serial.Serial(port, baudrate, timeout=1) as pico:
+                with serial_lock:
+                    serial_connection = pico
+                update_runtime(port=port, last_error="Starting Pico runtime")
+                start_pico_runtime(pico)
+                while not stop_event.is_set():
+                    line = pico.readline().decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        process_serial_line(line)
+                    except (json.JSONDecodeError, TypeError, ValueError) as error:
+                        update_runtime(last_error=f"Invalid Pico line: {error}")
+        except (FileNotFoundError, ValueError, serial.SerialException, OSError) as error:
+            update_runtime(pico_connected=False, last_error=str(error))
+        finally:
             with serial_lock:
-                serial_connection = pico
-            update_runtime(port=port, last_error="Starting Pico runtime")
-            start_pico_runtime(pico)
-            while not stop_event.is_set():
-                line = pico.readline().decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    process_serial_line(line)
-                except (json.JSONDecodeError, TypeError, ValueError) as error:
-                    update_runtime(last_error=f"Invalid Pico line: {error}")
-    except (FileNotFoundError, ValueError, serial.SerialException) as error:
-        update_runtime(pico_connected=False, last_error=str(error))
-    finally:
-        with serial_lock:
-            serial_connection = None
+                serial_connection = None
+        stop_event.wait(3)
 
 
 def simulation_worker() -> None:
@@ -518,6 +666,10 @@ def daily_report_job() -> None:
     create_report(send_telegram=True)
 
 
+def led_schedule_job() -> None:
+    reconcile_led_schedule()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global scheduler
@@ -526,11 +678,19 @@ async def lifespan(_app: FastAPI):
     stop_event.clear()
     worker = threading.Thread(target=simulation_worker if SIMULATION else serial_worker, daemon=True)
     worker.start()
+    scheduler = BackgroundScheduler(timezone="Asia/Seoul")
+    scheduler.add_job(
+        led_schedule_job,
+        "interval",
+        seconds=15,
+        id="led_photoperiod",
+        max_instances=1,
+        coalesce=True,
+    )
     if AUTOMATION_ENABLED:
-        scheduler = BackgroundScheduler(timezone="Asia/Seoul")
         scheduler.add_job(capture_and_analyze_job, "cron", hour="0,6,12,18", minute=0, id="capture_analysis", max_instances=1)
         scheduler.add_job(daily_report_job, "cron", hour=20, minute=0, id="daily_report", max_instances=1)
-        scheduler.start()
+    scheduler.start()
     yield
     stop_event.set()
     if scheduler:
@@ -550,10 +710,81 @@ def health() -> dict[str, Any]:
         "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED,
         "automation_enabled": AUTOMATION_ENABLED, "configured_model": OPENAI_MODEL,
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "led_schedule_hardware_enabled": LED_SCHEDULE_HARDWARE_ENABLED,
         "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
         "camera_count": len(camera_configs()), "database_path": str(DB_PATH),
         "pico_error": latest.get("error"),
     }
+
+
+@app.get("/api/settings/openai", dependencies=[Depends(require_auth)])
+def openai_settings() -> dict[str, Any]:
+    return {
+        "configured": bool(os.getenv("OPENAI_API_KEY")),
+        "model": OPENAI_MODEL,
+    }
+
+
+@app.put(
+    "/api/settings/openai",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def save_openai_settings(request: OpenAISettingsRequest) -> dict[str, Any]:
+    global OPENAI_MODEL
+    values = {"OPENAI_MODEL": request.model.strip()}
+    api_key = (request.api_key or "").strip()
+    if api_key:
+        if "\n" in api_key or "\r" in api_key or len(api_key) < 20:
+            raise HTTPException(400, "Invalid API key format")
+        values["OPENAI_API_KEY"] = api_key
+    update_env_file(values)
+    OPENAI_MODEL = values["OPENAI_MODEL"]
+    return {
+        "configured": bool(os.getenv("OPENAI_API_KEY")),
+        "model": OPENAI_MODEL,
+        "message": "OpenAI settings saved on the server",
+    }
+
+
+@app.post(
+    "/api/settings/openai/test",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def test_openai_settings() -> dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(409, "Save an OpenAI API key first")
+    try:
+        model = OpenAI(api_key=api_key).models.retrieve(OPENAI_MODEL)
+        return {"ok": True, "model": getattr(model, "id", OPENAI_MODEL)}
+    except Exception as error:
+        raise HTTPException(
+            400,
+            f"OpenAI connection failed: {type(error).__name__}: {str(error)[:180]}",
+        ) from error
+
+
+@app.get("/api/led-schedule", dependencies=[Depends(require_auth)])
+def get_led_schedule() -> dict[str, Any]:
+    return led_schedule_config()
+
+
+@app.put(
+    "/api/led-schedule",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def save_led_schedule(request: LedScheduleRequest) -> dict[str, Any]:
+    try:
+        photoperiod_minutes(request.on_time, request.off_time)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    store.set_settings({
+        "led_schedule_enabled": "1" if request.enabled else "0",
+        "led_schedule_on_time": request.on_time,
+        "led_schedule_off_time": request.off_time,
+    })
+    result = reconcile_led_schedule(force=True)
+    return {**result, "saved": True}
 
 
 @app.get("/api/sensors/latest", dependencies=[Depends(require_auth)])
