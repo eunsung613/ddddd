@@ -17,16 +17,19 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import requests
+import paho.mqtt.client as mqtt
 import serial
 import paho.mqtt.client as mqtt
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -53,9 +56,15 @@ SIMULATION = os.getenv("SMARTFARM_SIMULATION", "0") == "1"
 CONTROL_ENABLED = os.getenv("SMARTFARM_CONTROL_ENABLED", "0") == "1"
 CHEMICAL_CONTROL_ENABLED = os.getenv("SMARTFARM_CHEMICAL_CONTROL_ENABLED", "0") == "1"
 AUTOMATION_ENABLED = os.getenv("SMARTFARM_AUTOMATION_ENABLED", "1") == "1"
+LED_SCHEDULE_HARDWARE_ENABLED = (
+    os.getenv("SMARTFARM_LED_SCHEDULE_HARDWARE_ENABLED", "0") == "1"
+)
+MQTT_PUBLISH_ENABLED = os.getenv("SMARTFARM_MQTT_PUBLISH_ENABLED", "0") == "1"
+MQTT_SUBSCRIBE_ENABLED = os.getenv("SMARTFARM_MQTT_SUBSCRIBE_ENABLED", "0") == "1"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
 MQTT_MODE = os.getenv("SMARTFARM_MQTT_MODE", "off").strip().lower()
 SENSOR_STALE_SECONDS = 20
+SEOUL = ZoneInfo("Asia/Seoul")
 
 if MQTT_MODE not in ("off", "publish", "subscribe"):
     raise ValueError("SMARTFARM_MQTT_MODE must be off, publish or subscribe")
@@ -76,6 +85,8 @@ stop_event = threading.Event()
 serial_lock = threading.Lock()
 state_lock = threading.Lock()
 serial_connection: serial.Serial | None = None
+mqtt_connection: mqtt.Client | None = None
+mqtt_sequence = 0
 scheduler: BackgroundScheduler | None = None
 mqtt_client: mqtt.Client | None = None
 mqtt_config: dict[str, Any] | None = None
@@ -88,8 +99,12 @@ runtime_state: dict[str, Any] = {
     "updated_at_epoch": None,
     "actuators": {name: "off" for name in ACTUATORS},
     "last_ack": None,
+    "sensor_errors": {},
     "mqtt_connected": False,
     "mqtt_error": None,
+    "mqtt_topic": None,
+    "led_schedule_error": None,
+    "led_schedule_last_run": None,
 }
 
 
@@ -106,6 +121,29 @@ class DecisionRequest(BaseModel):
     note: str = Field(default="", max_length=300)
 
 
+class OpenAISettingsRequest(BaseModel):
+    api_key: str | None = Field(default=None, max_length=300)
+    model: str = Field(min_length=2, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
+
+
+class CameraSettingsItem(BaseModel):
+    slot: int = Field(ge=1, le=4)
+    label: str = Field(default="", max_length=80)
+    snapshot_url: str = Field(default="", max_length=500)
+    username: str = Field(default="", max_length=100)
+    password: str | None = Field(default=None, max_length=200)
+
+
+class CameraSettingsRequest(BaseModel):
+    cameras: list[CameraSettingsItem] = Field(min_length=1, max_length=4)
+
+
+class LedScheduleRequest(BaseModel):
+    enabled: bool
+    on_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    off_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
 def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -> None:
     username = os.getenv("DASHBOARD_USERNAME")
     password = os.getenv("DASHBOARD_PASSWORD")
@@ -120,6 +158,12 @@ def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -
         raise HTTPException(401, "Invalid login", headers={"WWW-Authenticate": "Basic"})
 
 
+def require_local_settings(request: Request) -> None:
+    host = request.client.host if request.client else None
+    if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        raise HTTPException(403, "Settings can only be changed on the server laptop")
+
+
 def load_serial_config() -> tuple[str, int]:
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Missing {CONFIG_PATH.name}")
@@ -131,21 +175,29 @@ def load_serial_config() -> tuple[str, int]:
 
 
 def load_mqtt_config() -> dict[str, Any]:
-    path = CONFIG_PATH if MQTT_MODE == "publish" else HOME_CONFIG_PATH
+    default_path = ROOT / ("config.home.json" if MQTT_SUBSCRIBE_ENABLED else "config.school.json")
+    path = Path(os.getenv("SMARTFARM_MQTT_CONFIG", default_path))
+    if not path.is_absolute():
+        path = ROOT / path
     if not path.exists():
         raise FileNotFoundError(f"Missing {path.name}")
-    config = json.loads(path.read_text(encoding="utf-8"))
-    if not config.get("mqtt_broker") or not config.get("topics", {}).get("telemetry"):
-        raise ValueError(f"Set mqtt_broker and topics.telemetry in {path.name}")
-    return config
+    config = json.loads(path.read_text(encoding="utf-8-sig"))
+    topic = (config.get("topics") or {}).get("telemetry")
+    if not config.get("mqtt_broker") or not topic:
+        raise ValueError(f"Invalid MQTT broker or telemetry topic in {path.name}")
+    return {
+        **config,
+        "mqtt_port": int(config.get("mqtt_port", 1883)),
+        "telemetry_topic": str(topic),
+    }
 
 
 def make_mqtt_client(config: dict[str, Any]) -> mqtt.Client:
-    if MQTT_MODE == "publish":
-        client_id = str(config.get("mqtt_client_id", "school_dashboard_publisher"))
+    if MQTT_SUBSCRIBE_ENABLED:
+        prefix = config.get("mqtt_subscriber_client_id_prefix", "smartfarm_dashboard_subscriber")
+        client_id = f"{prefix}_{secrets.token_hex(4)}"
     else:
-        prefix = str(config.get("mqtt_subscriber_client_id_prefix", "home_dashboard"))
-        client_id = f"{prefix}_{uuid.uuid4().hex[:8]}"
+        client_id = str(config.get("mqtt_client_id", "smartfarm_dashboard_publisher"))
     if hasattr(mqtt, "CallbackAPIVersion"):
         client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -153,146 +205,284 @@ def make_mqtt_client(config: dict[str, Any]) -> mqtt.Client:
         )
     else:
         client = mqtt.Client(client_id=client_id)
-    username = config.get("mqtt_username")
-    if username:
-        client.username_pw_set(str(username), str(config.get("mqtt_password", "")))
-    if config.get("mqtt_tls"):
-        client.tls_set()
+    client.user_data_set({"topic": config["telemetry_topic"]})
     client.reconnect_delay_set(min_delay=1, max_delay=30)
     return client
 
 
-def normalize_mqtt_telemetry(data: dict[str, Any]) -> dict[str, Any]:
+def mqtt_sensor_payload(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Return sensor-only telemetry; never expose commands, secrets or camera data."""
     return {
-        "air_temp": data.get("air_temp", data.get("temp_c")),
-        "humidity": data.get("humidity", data.get("rh")),
-        "co2": data.get("co2", data.get("co2_ppm")),
-        "scd40_temp": data.get("scd40_temp"),
-        "scd40_humidity": data.get("scd40_humidity"),
-        "ec": data.get("ec"),
-        "ph": data.get("ph"),
-        "solution_temp": data.get("solution_temp", data.get("solution_temp_c")),
-        "actuators": data.get("actuators", {}),
-        "mqtt_ts": data.get("ts"),
-        "mqtt_seq": data.get("seq"),
-    }
-
-
-def ingest_mqtt_telemetry(data: dict[str, Any]) -> None:
-    if data.get("type") != "telemetry":
-        raise ValueError("MQTT payload type is not telemetry")
-    payload = normalize_mqtt_telemetry(data)
-    if not any(payload.get(key) is not None for key in ("air_temp", "humidity", "co2", "ec", "ph")):
-        raise ValueError("MQTT telemetry has no supported sensor value")
-    store.add_sensor(payload, "measured:mqtt_school")
-    update_runtime(
-        pico_connected=True,
-        port="MQTT",
-        last_error=None,
-        updated_at_epoch=time.time(),
-        actuators=payload.get("actuators") or runtime_state["actuators"],
-    )
-
-
-def mqtt_on_connect(
-    client: mqtt.Client,
-    _userdata: Any,
-    _flags: Any,
-    reason_code: Any,
-    _properties: Any = None,
-) -> None:
-    failed = bool(getattr(reason_code, "is_failure", False))
-    update_runtime(
-        mqtt_connected=not failed,
-        mqtt_error=str(reason_code) if failed else None,
-    )
-    if not failed and MQTT_MODE == "subscribe" and mqtt_config:
-        client.subscribe(mqtt_config["topics"]["telemetry"], qos=0)
-
-
-def mqtt_on_disconnect(
-    _client: mqtt.Client,
-    _userdata: Any,
-    _disconnect_flags: Any,
-    reason_code: Any,
-    _properties: Any = None,
-) -> None:
-    values: dict[str, Any] = {
-        "mqtt_connected": False,
-        "mqtt_error": f"MQTT disconnected: {reason_code}",
-    }
-    if MQTT_MODE == "subscribe":
-        values.update(pico_connected=False, last_error="MQTT connection lost")
-    update_runtime(**values)
-
-
-def mqtt_on_message(
-    _client: mqtt.Client,
-    _userdata: Any,
-    message: mqtt.MQTTMessage,
-) -> None:
-    try:
-        data = json.loads(message.payload.decode("utf-8"))
-        ingest_mqtt_telemetry(data)
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
-        update_runtime(last_error=f"Invalid MQTT telemetry: {error}")
-
-
-def start_mqtt_transport() -> None:
-    global mqtt_client, mqtt_config
-    if SIMULATION or MQTT_MODE == "off":
-        return
-    mqtt_config = load_mqtt_config()
-    mqtt_client = make_mqtt_client(mqtt_config)
-    mqtt_client.on_connect = mqtt_on_connect
-    mqtt_client.on_disconnect = mqtt_on_disconnect
-    if MQTT_MODE == "subscribe":
-        mqtt_client.on_message = mqtt_on_message
-    mqtt_client.connect_async(
-        str(mqtt_config["mqtt_broker"]),
-        int(mqtt_config.get("mqtt_port", 1883)),
-        keepalive=60,
-    )
-    mqtt_client.loop_start()
-
-
-def stop_mqtt_transport() -> None:
-    global mqtt_client
-    if mqtt_client is None:
-        return
-    mqtt_client.disconnect()
-    mqtt_client.loop_stop()
-    mqtt_client = None
-
-
-def publish_mqtt_telemetry(payload: dict[str, Any]) -> None:
-    global mqtt_sequence
-    if MQTT_MODE != "publish" or mqtt_client is None or mqtt_config is None:
-        return
-    mqtt_sequence += 1
-    message = {
         "type": "telemetry",
-        "site_id": mqtt_config.get("site_id", "school"),
-        "zone_id": mqtt_config.get("zone_id", "room1"),
-        "device_id": mqtt_config.get("device_id", "pico2w_001"),
-        "bridge_id": mqtt_config.get("bridge_id", "school_dashboard"),
-        "seq": mqtt_sequence,
+        "site_id": config.get("site_id"),
+        "zone_id": config.get("zone_id"),
+        "device_id": config.get("device_id"),
+        "bridge_id": config.get("bridge_id", config.get("mqtt_client_id")),
+        "air_temp": payload.get("air_temp"),
+        "temp_c": payload.get("air_temp"),
+        "humidity": payload.get("humidity"),
+        "rh": payload.get("humidity"),
+        "co2": payload.get("co2"),
+        "co2_ppm": payload.get("co2"),
+        "scd40_temp": payload.get("scd40_temp"),
+        "scd40_humidity": payload.get("scd40_humidity"),
+        "lux": payload.get("lux"),
+        "ec": payload.get("ec"),
+        "ph": payload.get("ph"),
+        "solution_temp": payload.get("solution_temp"),
+        "solution_temp_c": payload.get("solution_temp"),
+        "sensor_errors": payload.get("sensor_errors") or {},
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
-        **payload,
     }
-    result = mqtt_client.publish(
-        mqtt_config["topics"]["telemetry"],
-        json.dumps(message, ensure_ascii=False),
-        qos=0,
-        retain=False,
-    )
-    if result.rc != mqtt.MQTT_ERR_SUCCESS:
-        update_runtime(mqtt_error=f"MQTT publish failed: {result.rc}")
+
+
+def mqtt_to_sensor_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "air_temp": payload.get("air_temp", payload.get("temp_c")),
+        "humidity": payload.get("humidity", payload.get("rh")),
+        "co2": payload.get("co2", payload.get("co2_ppm")),
+        "scd40_temp": payload.get("scd40_temp"),
+        "scd40_humidity": payload.get("scd40_humidity"),
+        "lux": payload.get("lux"),
+        "ec": payload.get("ec"),
+        "ph": payload.get("ph"),
+        "solution_temp": payload.get("solution_temp", payload.get("solution_temp_c")),
+        "sensor_errors": payload.get("sensor_errors") or {},
+        "mqtt_ts": payload.get("ts"),
+    }
+
+
+def on_mqtt_connect(
+    client: mqtt.Client,
+    userdata: Any,
+    flags: Any,
+    reason_code: Any,
+    properties: Any = None,
+) -> None:
+    del flags, properties
+    if reason_code != 0:
+        update_runtime(mqtt_connected=False, mqtt_error=f"MQTT connect failed: {reason_code}")
+        return
+    topic = userdata["topic"]
+    update_runtime(mqtt_connected=True, mqtt_error=None, mqtt_topic=topic)
+    if MQTT_SUBSCRIBE_ENABLED:
+        client.subscribe(topic, qos=0)
+
+
+def on_mqtt_disconnect(
+    client: mqtt.Client,
+    userdata: Any,
+    disconnect_flags: Any,
+    reason_code: Any,
+    properties: Any = None,
+) -> None:
+    del client, userdata, disconnect_flags, properties
+    update_runtime(mqtt_connected=False, mqtt_error=f"MQTT disconnected: {reason_code}")
+
+
+def on_mqtt_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
+    del client, userdata
+    try:
+        payload = json.loads(message.payload.decode("utf-8"))
+        if payload.get("type") != "telemetry":
+            return
+        sensor = mqtt_to_sensor_payload(payload)
+        store.add_sensor(sensor, "measured:mqtt")
+        sensor_errors = sensor["sensor_errors"]
+        update_runtime(
+            pico_connected=True,
+            port="MQTT",
+            last_error="; ".join(
+                f"{name}: {error}" for name, error in sensor_errors.items()
+            ) or None,
+            updated_at_epoch=time.time(),
+            sensor_errors=sensor_errors,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        update_runtime(mqtt_error=f"Invalid MQTT telemetry: {error}")
+
+
+def start_mqtt() -> None:
+    global mqtt_connection
+    if not (MQTT_PUBLISH_ENABLED or MQTT_SUBSCRIBE_ENABLED):
+        return
+    if MQTT_PUBLISH_ENABLED and MQTT_SUBSCRIBE_ENABLED:
+        raise RuntimeError("Enable only one MQTT dashboard mode")
+    config = load_mqtt_config()
+    client = make_mqtt_client(config)
+    client.on_connect = on_mqtt_connect
+    client.on_disconnect = on_mqtt_disconnect
+    if MQTT_SUBSCRIBE_ENABLED:
+        client.on_message = on_mqtt_message
+    mqtt_connection = client
+    update_runtime(mqtt_topic=config["telemetry_topic"])
+    client.connect_async(config["mqtt_broker"], config["mqtt_port"], keepalive=60)
+    client.loop_start()
+
+
+def stop_mqtt() -> None:
+    global mqtt_connection
+    client = mqtt_connection
+    mqtt_connection = None
+    if client is None:
+        return
+    client.disconnect()
+    client.loop_stop()
+    update_runtime(mqtt_connected=False)
+
+
+def publish_mqtt_sensor(payload: dict[str, Any]) -> None:
+    global mqtt_sequence
+    if not MQTT_PUBLISH_ENABLED or mqtt_connection is None:
+        return
+    try:
+        config = load_mqtt_config()
+        mqtt_sequence += 1
+        message = mqtt_sensor_payload(payload, config)
+        message["seq"] = mqtt_sequence
+        result = mqtt_connection.publish(
+            config["telemetry_topic"],
+            json.dumps(message, ensure_ascii=False),
+            qos=0,
+            retain=False,
+        )
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            update_runtime(mqtt_error=f"MQTT publish failed: {result.rc}")
+    except (FileNotFoundError, ValueError, OSError) as error:
+        update_runtime(mqtt_error=f"MQTT publish failed: {error}")
 
 
 def update_runtime(**values: Any) -> None:
     with state_lock:
         runtime_state.update(values)
+
+
+def env_file_value(value: str) -> str:
+    if any(character in value for character in " #\t\"'"):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def update_env_file(values: dict[str, str]) -> None:
+    """Persist server-only settings without returning secrets to the browser."""
+    env_path = ROOT / ".env"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    remaining = dict(values)
+    updated: list[str] = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
+        if key in remaining:
+            updated.append(f"{key}={env_file_value(remaining.pop(key))}")
+        else:
+            updated.append(line)
+    if remaining and updated and updated[-1] != "":
+        updated.append("")
+    updated.extend(f"{key}={env_file_value(value)}" for key, value in remaining.items())
+    temporary = env_path.with_name(".env.tmp")
+    temporary.write_text("\n".join(updated) + "\n", encoding="utf-8")
+    temporary.replace(env_path)
+    os.environ.update(values)
+
+
+def time_minutes(value: str) -> int:
+    hour, minute = (int(part) for part in value.split(":"))
+    return hour * 60 + minute
+
+
+def photoperiod_minutes(on_time: str, off_time: str) -> int:
+    duration = (time_minutes(off_time) - time_minutes(on_time)) % (24 * 60)
+    if duration == 0:
+        raise ValueError("LED on and off times must be different")
+    if duration > 16 * 60:
+        raise ValueError("LED photoperiod cannot exceed 16 hours")
+    return duration
+
+
+def led_should_be_on(on_time: str, off_time: str, now: datetime) -> bool:
+    current = now.hour * 60 + now.minute
+    on_minute = time_minutes(on_time)
+    off_minute = time_minutes(off_time)
+    if on_minute < off_minute:
+        return on_minute <= current < off_minute
+    return current >= on_minute or current < off_minute
+
+
+def led_seconds_until_off(off_time: str, now: datetime) -> int:
+    off_hour, off_minute = (int(part) for part in off_time.split(":"))
+    target = now.replace(hour=off_hour, minute=off_minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(1, min(16 * 60 * 60, int((target - now).total_seconds())))
+
+
+def led_schedule_config() -> dict[str, Any]:
+    enabled = store.setting("led_schedule_enabled", "0") == "1"
+    on_time = store.setting("led_schedule_on_time", "06:00") or "06:00"
+    off_time = store.setting("led_schedule_off_time", "22:00") or "22:00"
+    now = datetime.now(SEOUL)
+    with state_lock:
+        current_state = runtime_state["actuators"].get("led", "unknown")
+        last_error = runtime_state.get("led_schedule_error")
+        last_run = runtime_state.get("led_schedule_last_run")
+    return {
+        "enabled": enabled,
+        "on_time": on_time,
+        "off_time": off_time,
+        "timezone": "Asia/Seoul",
+        "photoperiod_hours": round(photoperiod_minutes(on_time, off_time) / 60, 2),
+        "desired_state": "on" if enabled and led_should_be_on(on_time, off_time, now) else "off",
+        "current_state": current_state,
+        "hardware_enabled": LED_SCHEDULE_HARDWARE_ENABLED,
+        "last_error": last_error,
+        "last_run": last_run,
+    }
+
+
+def reconcile_led_schedule(force: bool = False) -> dict[str, Any]:
+    config = led_schedule_config()
+    desired = config["desired_state"]
+    now = datetime.now(SEOUL)
+    if not LED_SCHEDULE_HARDWARE_ENABLED:
+        update_runtime(led_schedule_error="LED schedule hardware output is disabled")
+        return {**led_schedule_config(), "result": "blocked"}
+    with state_lock:
+        connected = bool(runtime_state["pico_connected"])
+        current = runtime_state["actuators"].get("led", "unknown")
+    if not connected:
+        update_runtime(led_schedule_error="Pico USB is offline")
+        return {**led_schedule_config(), "result": "offline"}
+    if current == desired and not force:
+        update_runtime(led_schedule_error=None)
+        return {**config, "result": "unchanged"}
+    duration = led_seconds_until_off(config["off_time"], now) if desired == "on" else 0
+    command_id = secrets.token_hex(8)
+    command = {
+        "cmd_id": command_id,
+        "action": "set",
+        "actuator": "led",
+        "state": desired,
+        "duration_seconds": duration,
+    }
+    try:
+        send_pico_command(command)
+        timestamp = now.isoformat(timespec="seconds")
+        update_runtime(led_schedule_error=None, led_schedule_last_run=timestamp)
+        store.add_event({
+            "command_id": command_id,
+            "actuator": "led",
+            "requested_state": desired,
+            "duration_seconds": duration,
+            "source": "fixed_led_schedule",
+            "result": "sent",
+            "note": f"{config['on_time']}-{config['off_time']} Asia/Seoul",
+        })
+        store.workflow("led_photoperiod", "success", f"LED {desired}; {config['on_time']}-{config['off_time']}")
+        return {**led_schedule_config(), "result": "sent"}
+    except (RuntimeError, serial.SerialException, OSError) as error:
+        message = str(error)
+        update_runtime(led_schedule_error=message)
+        store.workflow("led_photoperiod", "failed", message)
+        return {**led_schedule_config(), "result": "failed"}
 
 
 def start_pico_runtime(pico: serial.Serial) -> None:
@@ -306,12 +496,16 @@ def process_serial_line(line: str) -> None:
     if line.startswith("TELEMETRY_JSON:"):
         payload = json.loads(line.split(":", 1)[1])
         store.add_sensor(payload, "measured:pico_usb")
-        publish_mqtt_telemetry(payload)
+        publish_mqtt_sensor(payload)
+        sensor_errors = payload.get("sensor_errors") or {}
         update_runtime(
             pico_connected=True,
-            last_error=None,
+            last_error="; ".join(
+                f"{name}: {message}" for name, message in sensor_errors.items()
+            ) or None,
             updated_at_epoch=time.time(),
             actuators=payload.get("actuators", runtime_state["actuators"]),
+            sensor_errors=sensor_errors,
         )
     elif line.startswith("ACK_JSON:"):
         update_runtime(last_ack=json.loads(line.split(":", 1)[1]))
@@ -322,26 +516,28 @@ def process_serial_line(line: str) -> None:
 
 def serial_worker() -> None:
     global serial_connection
-    try:
-        port, baudrate = load_serial_config()
-        with serial.Serial(port, baudrate, timeout=1) as pico:
+    while not stop_event.is_set():
+        try:
+            port, baudrate = load_serial_config()
+            with serial.Serial(port, baudrate, timeout=1) as pico:
+                with serial_lock:
+                    serial_connection = pico
+                update_runtime(port=port, last_error="Starting Pico runtime")
+                start_pico_runtime(pico)
+                while not stop_event.is_set():
+                    line = pico.readline().decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        process_serial_line(line)
+                    except (json.JSONDecodeError, TypeError, ValueError) as error:
+                        update_runtime(last_error=f"Invalid Pico line: {error}")
+        except (FileNotFoundError, ValueError, serial.SerialException, OSError) as error:
+            update_runtime(pico_connected=False, last_error=str(error))
+        finally:
             with serial_lock:
-                serial_connection = pico
-            update_runtime(port=port, last_error="Starting Pico runtime")
-            start_pico_runtime(pico)
-            while not stop_event.is_set():
-                line = pico.readline().decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    process_serial_line(line)
-                except (json.JSONDecodeError, TypeError, ValueError) as error:
-                    update_runtime(last_error=f"Invalid Pico line: {error}")
-    except (FileNotFoundError, ValueError, serial.SerialException) as error:
-        update_runtime(pico_connected=False, last_error=str(error))
-    finally:
-        with serial_lock:
-            serial_connection = None
+                serial_connection = None
+        stop_event.wait(3)
 
 
 def simulation_worker() -> None:
@@ -371,20 +567,56 @@ def mqtt_wait_worker() -> None:
 
 def latest_with_health() -> dict[str, Any]:
     latest = store.latest_sensor() or {}
+    if latest:
+        record_is_simulation = str(latest.get("source", "")).startswith("simulation:")
+        if record_is_simulation != SIMULATION:
+            latest = {}
     with state_lock:
         runtime = dict(runtime_state)
     epoch = runtime.get("updated_at_epoch")
     age = round(time.time() - epoch, 1) if epoch else None
     connected = bool(runtime["pico_connected"] and age is not None and age <= SENSOR_STALE_SECONDS)
+    sensor_errors = dict(runtime.get("sensor_errors") or {})
+    if latest.get("raw_json"):
+        try:
+            raw_payload = json.loads(latest["raw_json"])
+            sensor_errors = dict(raw_payload.get("sensor_errors") or sensor_errors)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    aht10_connected = bool(
+        connected and latest.get("air_temp") is not None and latest.get("humidity") is not None
+    )
+    scd40_connected = bool(connected and latest.get("co2") is not None)
+    pe350_connected = bool(
+        connected
+        and latest.get("ec") is not None
+        and latest.get("ph") is not None
+        and latest.get("solution_temp") is not None
+    )
+    sensor_control_ready = aht10_connected and scd40_connected and pe350_connected
+    i2c_errors = "; ".join(
+        f"{name}: {sensor_errors[name]}"
+        for name in ("aht10", "scd40")
+        if name in sensor_errors
+    ) or None
     return {
         **latest,
         "pico_connected": connected,
         "port": runtime["port"],
         "age_seconds": age,
-        "error": runtime["last_error"] if not connected else None,
+        "error": runtime["last_error"],
         "actuators": runtime["actuators"],
         "simulation": SIMULATION,
-        "mqtt_mode": MQTT_MODE,
+        "sensor_errors": sensor_errors,
+        "aht10_connected": aht10_connected,
+        "scd40_connected": scd40_connected,
+        "pe350_connected": pe350_connected,
+        "sensor_control_ready": sensor_control_ready,
+        "i2c_connected": aht10_connected or scd40_connected,
+        "i2c_age_seconds": age,
+        "i2c_error": i2c_errors,
+        "pe350_age_seconds": age,
+        "pe350_error": sensor_errors.get("pe350"),
     }
 
 
@@ -417,8 +649,8 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
     if not CONTROL_ENABLED:
         return "simulated", "CONTROL_ENABLED=0; approval logged without hardware output"
     latest = latest_with_health()
-    if not latest["pico_connected"]:
-        raise HTTPException(409, "Pico data is offline or stale")
+    if not latest["sensor_control_ready"]:
+        raise HTTPException(409, "Required sensor evidence is incomplete or stale")
     command = {
         "cmd_id": secrets.token_hex(8), "action": "set", "actuator": actuator,
         "state": state, "duration_seconds": duration,
@@ -438,11 +670,45 @@ def camera_configs() -> list[dict[str, str]]:
         url = os.getenv(f"CAMERA_{number}_SNAPSHOT_URL", "").strip()
         if url:
             cameras.append({
-                "id": f"CAM-{number:02d}", "url": url,
+                "id": f"CAM-{number:02d}", "slot": number, "url": url,
+                "label": os.getenv(f"CAMERA_{number}_LABEL", "").strip() or f"카메라 {number}",
                 "username": os.getenv(f"CAMERA_{number}_USERNAME", ""),
                 "password": os.getenv(f"CAMERA_{number}_PASSWORD", ""),
             })
     return cameras
+
+
+def public_camera_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return url.split("@")[-1]
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def camera_settings_payload() -> dict[str, Any]:
+    configured = {int(item["slot"]): item for item in camera_configs()}
+    slots = []
+    for number in range(1, 5):
+        item = configured.get(number)
+        slots.append({
+            "slot": number,
+            "id": f"CAM-{number:02d}",
+            "label": item["label"] if item else os.getenv(f"CAMERA_{number}_LABEL", "").strip() or f"카메라 {number}",
+            "snapshot_url": public_camera_url(item["url"]) if item else "",
+            "username": item["username"] if item else os.getenv(f"CAMERA_{number}_USERNAME", ""),
+            "password_saved": bool(os.getenv(f"CAMERA_{number}_PASSWORD", "")),
+            "configured": item is not None,
+        })
+    return {
+        "configured": [
+            {"id": item["id"], "slot": item["slot"], "label": item["label"], "url": public_camera_url(item["url"])}
+            for item in configured.values()
+        ],
+        "slots": slots,
+        "captures": store.captures(),
+    }
 
 
 def capture_cameras() -> list[dict[str, Any]]:
@@ -462,12 +728,14 @@ def capture_cameras() -> list[dict[str, Any]]:
                 raise ValueError("Camera response is not JPEG")
             path.write_bytes(response.content)
             capture_id = store.add_capture(camera["id"], str(path), "success", None)
-            results.append({"id": capture_id, "camera_id": camera["id"], "status": "success"})
+            results.append({"id": capture_id, "camera_id": camera["id"], "label": camera["label"], "status": "success"})
         except (requests.RequestException, OSError, ValueError) as error:
             capture_id = store.add_capture(camera["id"], None, "failed", str(error))
-            results.append({"id": capture_id, "camera_id": camera["id"], "status": "failed", "error": str(error)})
+            results.append({"id": capture_id, "camera_id": camera["id"], "label": camera["label"], "status": "failed", "error": str(error)})
+    successes = sum(item["status"] == "success" for item in results)
+    workflow_status = "skipped" if not cameras else "success" if successes == len(cameras) else "partial" if successes else "failed"
     store.workflow(
-        "camera_capture", "success" if cameras else "skipped",
+        "camera_capture", workflow_status,
         json.dumps(results, ensure_ascii=False) if cameras else "No camera is configured",
     )
     return results
@@ -657,32 +925,41 @@ def daily_report_job() -> None:
     create_report(send_telegram=True)
 
 
+def led_schedule_job() -> None:
+    reconcile_led_schedule()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global scheduler
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     store.initialize()
     stop_event.clear()
-    start_mqtt_transport()
-    if SIMULATION:
-        worker_target = simulation_worker
-    elif MQTT_MODE == "subscribe":
-        worker_target = mqtt_wait_worker
-    else:
-        worker_target = serial_worker
-    worker = threading.Thread(target=worker_target, daemon=True)
-    worker.start()
+    start_mqtt()
+    worker = None
+    if not MQTT_SUBSCRIBE_ENABLED:
+        worker = threading.Thread(target=simulation_worker if SIMULATION else serial_worker, daemon=True)
+        worker.start()
+    scheduler = BackgroundScheduler(timezone="Asia/Seoul")
+    scheduler.add_job(
+        led_schedule_job,
+        "interval",
+        seconds=15,
+        id="led_photoperiod",
+        max_instances=1,
+        coalesce=True,
+    )
     if AUTOMATION_ENABLED:
-        scheduler = BackgroundScheduler(timezone="Asia/Seoul")
         scheduler.add_job(capture_and_analyze_job, "cron", hour="0,6,12,18", minute=0, id="capture_analysis", max_instances=1)
         scheduler.add_job(daily_report_job, "cron", hour=20, minute=0, id="daily_report", max_instances=1)
-        scheduler.start()
+    scheduler.start()
     yield
     stop_event.set()
     if scheduler:
         scheduler.shutdown(wait=False)
-    stop_mqtt_transport()
-    worker.join(timeout=2)
+    if worker:
+        worker.join(timeout=2)
+    stop_mqtt()
 
 
 app = FastAPI(title="Broccoli Smart Farm Control Center", version="2.0", lifespan=lifespan)
@@ -691,6 +968,14 @@ app = FastAPI(title="Broccoli Smart Farm Control Center", version="2.0", lifespa
 @app.get("/api/health", dependencies=[Depends(require_auth)])
 def health() -> dict[str, Any]:
     latest = latest_with_health()
+    with state_lock:
+        mqtt_status = {
+            "publish_enabled": MQTT_PUBLISH_ENABLED,
+            "subscribe_enabled": MQTT_SUBSCRIBE_ENABLED,
+            "connected": bool(runtime_state["mqtt_connected"]),
+            "topic": runtime_state["mqtt_topic"],
+            "error": runtime_state["mqtt_error"],
+        }
     return {
         "server": "online", "database": "online", "pico": "online" if latest["pico_connected"] else "offline",
         "simulation": SIMULATION,
@@ -701,10 +986,82 @@ def health() -> dict[str, Any]:
         "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED and MQTT_MODE != "subscribe",
         "automation_enabled": AUTOMATION_ENABLED, "configured_model": OPENAI_MODEL,
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "led_schedule_hardware_enabled": LED_SCHEDULE_HARDWARE_ENABLED,
         "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
         "camera_count": len(camera_configs()), "database_path": str(DB_PATH),
         "pico_error": latest.get("error"),
+        "mqtt": mqtt_status,
     }
+
+
+@app.get("/api/settings/openai", dependencies=[Depends(require_auth)])
+def openai_settings() -> dict[str, Any]:
+    return {
+        "configured": bool(os.getenv("OPENAI_API_KEY")),
+        "model": OPENAI_MODEL,
+    }
+
+
+@app.put(
+    "/api/settings/openai",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def save_openai_settings(request: OpenAISettingsRequest) -> dict[str, Any]:
+    global OPENAI_MODEL
+    values = {"OPENAI_MODEL": request.model.strip()}
+    api_key = (request.api_key or "").strip()
+    if api_key:
+        if "\n" in api_key or "\r" in api_key or len(api_key) < 20:
+            raise HTTPException(400, "Invalid API key format")
+        values["OPENAI_API_KEY"] = api_key
+    update_env_file(values)
+    OPENAI_MODEL = values["OPENAI_MODEL"]
+    return {
+        "configured": bool(os.getenv("OPENAI_API_KEY")),
+        "model": OPENAI_MODEL,
+        "message": "OpenAI settings saved on the server",
+    }
+
+
+@app.post(
+    "/api/settings/openai/test",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def test_openai_settings() -> dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(409, "Save an OpenAI API key first")
+    try:
+        model = OpenAI(api_key=api_key).models.retrieve(OPENAI_MODEL)
+        return {"ok": True, "model": getattr(model, "id", OPENAI_MODEL)}
+    except Exception as error:
+        raise HTTPException(
+            400,
+            f"OpenAI connection failed: {type(error).__name__}: {str(error)[:180]}",
+        ) from error
+
+
+@app.get("/api/led-schedule", dependencies=[Depends(require_auth)])
+def get_led_schedule() -> dict[str, Any]:
+    return led_schedule_config()
+
+
+@app.put(
+    "/api/led-schedule",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def save_led_schedule(request: LedScheduleRequest) -> dict[str, Any]:
+    try:
+        photoperiod_minutes(request.on_time, request.off_time)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    store.set_settings({
+        "led_schedule_enabled": "1" if request.enabled else "0",
+        "led_schedule_on_time": request.on_time,
+        "led_schedule_off_time": request.off_time,
+    })
+    result = reconcile_led_schedule(force=True)
+    return {**result, "saved": True}
 
 
 @app.get("/api/sensors/latest", dependencies=[Depends(require_auth)])
@@ -763,8 +1120,40 @@ def decide(recommendation_id: int, request: DecisionRequest) -> dict[str, Any]:
 
 @app.get("/api/cameras", dependencies=[Depends(require_auth)])
 def cameras() -> dict[str, Any]:
-    return {"configured": [{"id": item["id"], "url": item["url"].split("@")[-1]} for item in camera_configs()],
-            "captures": store.captures()}
+    return camera_settings_payload()
+
+
+@app.put(
+    "/api/settings/cameras",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def save_camera_settings(request: CameraSettingsRequest) -> dict[str, Any]:
+    slots = [item.slot for item in request.cameras]
+    if len(slots) != len(set(slots)):
+        raise HTTPException(400, "Camera slots must be unique")
+    values: dict[str, str] = {}
+    for item in request.cameras:
+        label = item.label.strip() or f"카메라 {item.slot}"
+        url = item.snapshot_url.strip()
+        username = item.username.strip()
+        for value in (label, url, username, item.password or ""):
+            if "\n" in value or "\r" in value:
+                raise HTTPException(400, "Camera settings cannot contain line breaks")
+        if url:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise HTTPException(400, f"CAM-{item.slot:02d} snapshot URL must use http or https")
+            if parsed.username or parsed.password:
+                raise HTTPException(400, f"CAM-{item.slot:02d} credentials must use the separate account fields")
+        prefix = f"CAMERA_{item.slot}"
+        values[f"{prefix}_LABEL"] = label
+        values[f"{prefix}_SNAPSHOT_URL"] = url
+        values[f"{prefix}_USERNAME"] = username
+        password = item.password or ""
+        if password or not url:
+            values[f"{prefix}_PASSWORD"] = password
+    update_env_file(values)
+    return camera_settings_payload()
 
 
 @app.post("/api/cameras/capture", dependencies=[Depends(require_auth)])

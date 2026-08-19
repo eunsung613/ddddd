@@ -1,6 +1,6 @@
 """Pico 2 W integrated telemetry and relay runtime.
 
-The school laptop starts this file over USB serial. Relays are active LOW and
+The school laptop starts this file over USB serial. Relays are active HIGH and
 are forced OFF at boot. PE350 access remains read-only (Modbus function 0x04).
 """
 
@@ -20,7 +20,13 @@ except ImportError:
     import select
 
 import config
-from smartfarm_pins import RELAY_OFF, RELAY_ON, RELAY_PINS
+from smartfarm_pins import (
+    ACTUATOR_OUTPUTS_ARMED,
+    LED_SCHEDULE_OUTPUT_ARMED,
+    RELAY_OFF,
+    RELAY_ON,
+    RELAY_PINS,
+)
 from sensors.pe350 import (
     PE350Modbus,
     ec_us_cm_to_ds_m,
@@ -77,33 +83,74 @@ class EnvironmentSensors:
             freq=100000,
         )
         devices = self.i2c.scan()
-        if AHT10_ADDRESS not in devices:
-            raise RuntimeError("AHT10 not found at 0x38")
-        if SCD40_ADDRESS not in devices:
-            raise RuntimeError("SCD40 not found at 0x62")
-        self.i2c.writeto(AHT10_ADDRESS, b"\xE1\x08\x00")
-        time.sleep_ms(20)
-        self.i2c.writeto(SCD40_ADDRESS, b"\x21\xB1")
-        time.sleep_ms(5000)
+        self.aht10_available = AHT10_ADDRESS in devices
+        self.scd40_available = SCD40_ADDRESS in devices
+        self.startup_errors = {}
+
+        if self.aht10_available:
+            try:
+                self.i2c.writeto(AHT10_ADDRESS, b"\xE1\x08\x00")
+                time.sleep_ms(20)
+            except Exception as error:
+                self.aht10_available = False
+                self.startup_errors["aht10"] = str(error)
+        else:
+            self.startup_errors["aht10"] = "not found at 0x38"
+
+        if self.scd40_available:
+            try:
+                self.i2c.writeto(SCD40_ADDRESS, b"\x21\xB1")
+                time.sleep_ms(5000)
+            except Exception as error:
+                self.scd40_available = False
+                self.startup_errors["scd40"] = str(error)
+        else:
+            self.startup_errors["scd40"] = "not found at 0x62"
 
     def read(self):
-        self.i2c.writeto(AHT10_ADDRESS, b"\xAC\x33\x00")
-        time.sleep_ms(100)
-        aht = self.i2c.readfrom(AHT10_ADDRESS, 6)
-        if aht[0] & 0x80:
-            raise RuntimeError("AHT10 is busy")
-        raw_humidity = (aht[1] << 12) | (aht[2] << 4) | (aht[3] >> 4)
-        raw_temperature = ((aht[3] & 0x0F) << 16) | (aht[4] << 8) | aht[5]
-        air_temp = raw_temperature * 200.0 / 1048576 - 50.0
-        humidity = raw_humidity * 100.0 / 1048576
+        payload = {}
+        errors = dict(self.startup_errors)
 
-        self.i2c.writeto(SCD40_ADDRESS, b"\xEC\x05")
-        time.sleep_ms(10)
-        scd = self.i2c.readfrom(SCD40_ADDRESS, 9)
-        co2 = read_word(scd, 0)
-        scd_temp = -45.0 + 175.0 * read_word(scd, 3) / 65535
-        scd_humidity = 100.0 * read_word(scd, 6) / 65535
-        return air_temp, humidity, co2, scd_temp, scd_humidity
+        if self.aht10_available:
+            try:
+                self.i2c.writeto(AHT10_ADDRESS, b"\xAC\x33\x00")
+                time.sleep_ms(100)
+                aht = self.i2c.readfrom(AHT10_ADDRESS, 6)
+                if aht[0] & 0x80:
+                    raise RuntimeError("AHT10 is busy")
+                raw_humidity = (aht[1] << 12) | (aht[2] << 4) | (aht[3] >> 4)
+                raw_temperature = ((aht[3] & 0x0F) << 16) | (aht[4] << 8) | aht[5]
+                payload["air_temp"] = round(
+                    raw_temperature * 200.0 / 1048576 - 50.0,
+                    2,
+                )
+                payload["humidity"] = round(
+                    raw_humidity * 100.0 / 1048576,
+                    2,
+                )
+                errors.pop("aht10", None)
+            except Exception as error:
+                errors["aht10"] = str(error)
+
+        if self.scd40_available:
+            try:
+                self.i2c.writeto(SCD40_ADDRESS, b"\xEC\x05")
+                time.sleep_ms(10)
+                scd = self.i2c.readfrom(SCD40_ADDRESS, 9)
+                payload["co2"] = int(read_word(scd, 0))
+                payload["scd40_temp"] = round(
+                    -45.0 + 175.0 * read_word(scd, 3) / 65535,
+                    2,
+                )
+                payload["scd40_humidity"] = round(
+                    100.0 * read_word(scd, 6) / 65535,
+                    2,
+                )
+                errors.pop("scd40", None)
+            except Exception as error:
+                errors["scd40"] = str(error)
+
+        return payload, errors
 
 
 relays = {}
@@ -122,6 +169,13 @@ def set_relay(name, turn_on, duration_seconds=0):
     if name not in relays:
         raise ValueError("Unknown actuator: " + str(name))
     if turn_on:
+        output_armed = (
+            LED_SCHEDULE_OUTPUT_ARMED
+            if name == "led"
+            else ACTUATOR_OUTPUTS_ARMED
+        )
+        if not output_armed:
+            raise RuntimeError("Pico actuator outputs are not armed")
         duration_seconds = int(duration_seconds)
         if duration_seconds <= 0 or duration_seconds > MAX_ON_SECONDS[name]:
             raise ValueError("Invalid duration for " + name)
@@ -174,32 +228,41 @@ def handle_command(line):
 
 
 def read_telemetry(environment, pe350):
-    air_temp, humidity, co2, scd_temp, scd_humidity = environment.read()
-    ec_raw = pe350.read_ec_us_cm()
-    time.sleep_ms(100)
-    ph_raw = pe350.read_ph_raw()
-    time.sleep_ms(100)
-    solution_temp_raw = pe350.read_temperature_raw()
-    return {
+    environment_payload, sensor_errors = environment.read()
+    payload = {
         "type": "telemetry",
-        "air_temp": round(air_temp, 2),
-        "humidity": round(humidity, 2),
-        "co2": int(co2),
-        "scd40_temp": round(scd_temp, 2),
-        "scd40_humidity": round(scd_humidity, 2),
-        "ec": round(ec_us_cm_to_ds_m(ec_raw), 3),
-        "ph": round(ph_raw_to_ph(ph_raw), 2),
-        "solution_temp": round(temperature_raw_to_c(solution_temp_raw), 1),
         "actuators": {
             name: "on" if relay.value() == RELAY_ON else "off"
             for name, relay in relays.items()
         },
     }
+    payload.update(environment_payload)
+    try:
+        ec_raw = pe350.read_ec_us_cm()
+        time.sleep_ms(100)
+        ph_raw = pe350.read_ph_raw()
+        time.sleep_ms(100)
+        solution_temp_raw = pe350.read_temperature_raw()
+        payload.update({
+            "ec": round(ec_us_cm_to_ds_m(ec_raw), 3),
+            "ph": round(ph_raw_to_ph(ph_raw), 2),
+            "solution_temp": round(temperature_raw_to_c(solution_temp_raw), 1),
+        })
+        sensor_errors.pop("pe350", None)
+    except Exception as error:
+        sensor_errors["pe350"] = str(error)
+    payload["sensor_errors"] = sensor_errors
+    return payload
 
 
 def main():
     all_off()
-    emit("RUNTIME_JSON:", {"status": "starting", "relays": "all_off"})
+    emit("RUNTIME_JSON:", {
+        "status": "starting",
+        "relays": "all_off",
+        "actuator_outputs_armed": ACTUATOR_OUTPUTS_ARMED,
+        "led_schedule_output_armed": LED_SCHEDULE_OUTPUT_ARMED,
+    })
     environment = EnvironmentSensors()
     pe350 = PE350Modbus()
     poll = select.poll()

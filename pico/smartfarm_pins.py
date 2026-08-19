@@ -1,11 +1,23 @@
-"""Verified control-box relay mapping (GPIO numbers, active LOW)."""
+"""Verified control-box relay mapping (GPIO numbers, active HIGH).
 
-RELAY_ON = 0
-RELAY_OFF = 1
+Physical actuator output has a separate device-side arm switch.  Keep it
+disabled until the relay inputs have been tested with actuator power removed.
+"""
+
+RELAY_ON = 1
+RELAY_OFF = 0
+
+# This is intentionally independent from the dashboard's CONTROL_ENABLED flag.
+# Both guards must be enabled before the Pico can energize an actuator.
+ACTUATOR_OUTPUTS_ARMED = False
+
+# LED photoperiod commands have a separate, narrow device-side permission.
+# This does not arm pumps, valves, mixers, or the fan.
+LED_SCHEDULE_OUTPUT_ARMED = True
 
 RELAY_PINS = {
     "led": 16,
-    "raw_water": 13,
+    "raw_water": 17,
     "supply": 18,
     "mixing": 19,
     "ec": 20,

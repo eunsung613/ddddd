@@ -108,6 +108,12 @@ class Store:
                     status TEXT NOT NULL,
                     detail TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -318,3 +324,23 @@ class Store:
                 "SELECT * FROM workflow_runs ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def setting(self, key: str, default: str | None = None) -> str | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT value FROM app_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row else default
+
+    def set_settings(self, values: dict[str, str]) -> None:
+        updated_at = self.now()
+        with self.connect() as db:
+            db.executemany(
+                """INSERT INTO app_settings (key, value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value = excluded.value,
+                       updated_at = excluded.updated_at""",
+                [(key, value, updated_at) for key, value in values.items()],
+            )
