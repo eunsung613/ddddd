@@ -84,7 +84,8 @@ class EnvironmentSensors:
         )
         devices = self.i2c.scan()
         self.aht10_available = AHT10_ADDRESS in devices
-        self.scd40_available = SCD40_ADDRESS in devices
+        self.scd40_enabled = bool(getattr(config, "SCD40_ENABLED", True))
+        self.scd40_available = self.scd40_enabled and SCD40_ADDRESS in devices
         self.startup_errors = {}
 
         if self.aht10_available:
@@ -104,7 +105,7 @@ class EnvironmentSensors:
             except Exception as error:
                 self.scd40_available = False
                 self.startup_errors["scd40"] = str(error)
-        else:
+        elif self.scd40_enabled:
             self.startup_errors["scd40"] = "not found at 0x62"
 
     def read(self):

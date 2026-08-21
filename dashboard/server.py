@@ -56,6 +56,7 @@ AUTOMATION_ENABLED = os.getenv("SMARTFARM_AUTOMATION_ENABLED", "1") == "1"
 LED_SCHEDULE_HARDWARE_ENABLED = (
     os.getenv("SMARTFARM_LED_SCHEDULE_HARDWARE_ENABLED", "0") == "1"
 )
+SCD40_REQUIRED = os.getenv("SMARTFARM_SCD40_REQUIRED", "1") == "1"
 MQTT_PUBLISH_ENABLED = os.getenv("SMARTFARM_MQTT_PUBLISH_ENABLED", "0") == "1"
 MQTT_SUBSCRIBE_ENABLED = os.getenv("SMARTFARM_MQTT_SUBSCRIBE_ENABLED", "0") == "1"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
@@ -588,11 +589,13 @@ def latest_with_health() -> dict[str, Any]:
         and latest.get("ph") is not None
         and latest.get("solution_temp") is not None
     )
-    sensor_control_ready = aht10_connected and scd40_connected and pe350_connected
+    sensor_control_ready = aht10_connected and pe350_connected and (
+        scd40_connected or not SCD40_REQUIRED
+    )
     i2c_errors = "; ".join(
         f"{name}: {sensor_errors[name]}"
         for name in ("aht10", "scd40")
-        if name in sensor_errors
+        if name in sensor_errors and (name != "scd40" or SCD40_REQUIRED)
     ) or None
     return {
         **latest,
@@ -606,6 +609,7 @@ def latest_with_health() -> dict[str, Any]:
         "sensor_errors": sensor_errors,
         "aht10_connected": aht10_connected,
         "scd40_connected": scd40_connected,
+        "scd40_required": SCD40_REQUIRED,
         "pe350_connected": pe350_connected,
         "sensor_control_ready": sensor_control_ready,
         "i2c_connected": aht10_connected or scd40_connected,
