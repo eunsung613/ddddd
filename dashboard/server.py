@@ -1051,6 +1051,10 @@ def decide_recommendation(recommendation_id: int, decision: str, operator: str, 
             status, execution_note = safe_execute(item, operator)
         except HTTPException as error:
             execution_note = str(error.detail)
+            if execution_note == "Another nutrient correction session is already running":
+                store.decide_recommendation(recommendation_id, "deferred", operator, execution_note)
+                record_decision_event(item, recommendation_id, "deferred", operator, execution_note)
+                return {"status": "deferred", "note": "현재 보정이 끝난 뒤 새 텔레그램 승인 요청을 보냅니다."}
             store.decide_recommendation(recommendation_id, "blocked", operator, execution_note)
             record_decision_event(item, recommendation_id, "blocked", operator, execution_note)
             return {"status": "blocked", "note": execution_note}
@@ -1310,10 +1314,14 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
         note = "보정 시간 정책이 변경되어 새 텔레그램 승인 요청으로 교체"
         store.decide_recommendation(int(pending["id"]), "superseded", "system", note)
         record_decision_event(pending, int(pending["id"]), "superseded", "system", note)
-    pending_titles = {item["title"] for item in store.recommendations() if item["status"] == "pending"}
+    recommendation_history = store.recommendations(200)
+    pending_titles = {item["title"] for item in recommendation_history if item["status"] == "pending"}
+    deferred_titles = {item["title"] for item in recommendation_history if item["status"] == "deferred"}
     created = []
     for item in candidates:
-        if item["title"] in pending_titles or not rule_alert_allowed(item["title"]):
+        if item["title"] in pending_titles:
+            continue
+        if item["title"] not in deferred_titles and not rule_alert_allowed(item["title"]):
             continue
         recommendation_id = add_actuator_recommendation(item)
         store.set_settings({"rule_alert:" + item["title"]: datetime.now(SEOUL).isoformat(timespec="seconds")})
