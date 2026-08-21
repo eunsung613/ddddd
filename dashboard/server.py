@@ -147,6 +147,7 @@ class TelegramSettingsRequest(BaseModel):
     approver_user_ids: str | None = Field(default=None, max_length=300)
     daily_enabled: bool = False
     approval_enabled: bool = False
+    allow_group_members: bool = False
 
 
 def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -> None:
@@ -420,15 +421,17 @@ def telegram_config() -> dict[str, Any]:
         config_error = str(error)
     daily_enabled = os.getenv("SMARTFARM_TELEGRAM_DAILY_ENABLED", "0") == "1"
     approval_enabled = os.getenv("SMARTFARM_TELEGRAM_APPROVAL_ENABLED", "0") == "1"
+    allow_group_members = os.getenv("SMARTFARM_TELEGRAM_ALLOW_GROUP_MEMBERS", "0") == "1"
     return {
         "token": token,
         "chat_id": chat_id,
         "approvers": approvers,
         "daily_enabled": daily_enabled,
         "approval_enabled": approval_enabled,
+        "allow_group_members": allow_group_members,
         "config_error": config_error,
         "configured": bool(token and chat_id),
-        "approvals_ready": bool(token and chat_id and approvers and approval_enabled and not config_error),
+        "approvals_ready": bool(token and chat_id and (approvers or allow_group_members) and approval_enabled and not config_error),
     }
 
 
@@ -441,6 +444,7 @@ def telegram_settings_payload() -> dict[str, Any]:
         "approver_count": len(config["approvers"]),
         "daily_enabled": config["daily_enabled"],
         "approval_enabled": config["approval_enabled"],
+        "allow_group_members": config["allow_group_members"],
         "approvals_ready": config["approvals_ready"],
         "config_error": config["config_error"],
         "polling": bool(runtime_state.get("telegram_polling")),
@@ -473,6 +477,21 @@ def telegram_api(method: str, *, data: dict[str, Any] | None = None,
     if not telegram_config()["configured"]:
         raise RuntimeError("Telegram bot token and chat ID are not configured")
     return telegram_bot_api(method, data=data, files=files, timeout=timeout)
+
+
+def telegram_group_member_allowed(chat_id: str, user_id: int) -> bool:
+    """Verify live membership for group-wide approval; bot admin access is required by Telegram."""
+    result = telegram_bot_api(
+        "getChatMember",
+        data={"chat_id": chat_id, "user_id": str(user_id)},
+        timeout=15,
+    )
+    if not isinstance(result, dict):
+        return False
+    status = result.get("status")
+    return status in {"creator", "administrator", "member"} or (
+        status == "restricted" and bool(result.get("is_member"))
+    )
 
 
 def telegram_send_message(text: str, reply_markup: dict[str, Any] | None = None) -> Any:
@@ -1144,7 +1163,9 @@ def process_telegram_callback(callback: dict[str, Any]) -> None:
             raise PermissionError("Telegram approval is not configured")
         if chat_id != config["chat_id"]:
             raise PermissionError("This chat is not permitted")
-        if user_id not in config["approvers"]:
+        explicitly_allowed = user_id in config["approvers"]
+        group_member_allowed = config["allow_group_members"] and telegram_group_member_allowed(chat_id, user_id)
+        if not explicitly_allowed and not group_member_allowed:
             raise PermissionError("You are not an approved operator")
         decision, recommendation_id = parse_telegram_callback(str(callback.get("data", "")))
         item = store.recommendation(recommendation_id)
@@ -1348,6 +1369,7 @@ def discover_telegram_chats() -> dict[str, Any]:
             timeout=15,
         ) or []
         chats: dict[str, dict[str, str]] = {}
+        approvers: dict[str, dict[str, str]] = {}
         for update in updates:
             if not isinstance(update, dict):
                 continue
@@ -1365,7 +1387,12 @@ def discover_telegram_chats() -> dict[str, Any]:
                     "title": str(chat.get("title") or "제목 없는 그룹")[:120],
                     "type": str(chat["type"]),
                 }
-        return {"chats": list(chats.values())}
+            sender = message.get("from") if isinstance(message, dict) else None
+            sender_id = str(sender.get("id", "")) if isinstance(sender, dict) else ""
+            if re.fullmatch(r"\d{4,20}", sender_id):
+                label = str(sender.get("username") or sender.get("first_name") or "이름 없는 사용자")[:80]
+                approvers[sender_id] = {"id": sender_id, "label": label, "chat_title": chats[chat_id]["title"]}
+        return {"chats": list(chats.values()), "approvers": list(approvers.values())}
     except Exception as error:
         raise HTTPException(400, f"Telegram group search failed: {type(error).__name__}: {str(error)[:180]}") from error
 
@@ -1394,11 +1421,12 @@ def save_telegram_settings(request: TelegramSettingsRequest) -> dict[str, Any]:
             approvers = telegram_approver_ids(effective_approvers_raw)
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
-    if request.approval_enabled and not (effective_token and effective_chat_id and approvers):
-        raise HTTPException(400, "Approval requires a bot token, chat ID, and at least one approved Telegram user ID")
+    if request.approval_enabled and not (effective_token and effective_chat_id and (approvers or request.allow_group_members)):
+        raise HTTPException(400, "Approval requires a bot token, chat ID, and an approved user ID or group-member approval")
     values = {
         "SMARTFARM_TELEGRAM_DAILY_ENABLED": "1" if request.daily_enabled else "0",
         "SMARTFARM_TELEGRAM_APPROVAL_ENABLED": "1" if request.approval_enabled else "0",
+        "SMARTFARM_TELEGRAM_ALLOW_GROUP_MEMBERS": "1" if request.allow_group_members else "0",
     }
     if token:
         values["TELEGRAM_BOT_TOKEN"] = token
