@@ -69,7 +69,6 @@ NUTRIENT_FEEDBACK_ENABLED = os.getenv("SMARTFARM_NUTRIENT_FEEDBACK_ENABLED", "0"
 EC_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_EC_PULSE_SECONDS", "3")), 10))
 PH_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_PH_PULSE_SECONDS", "1")), 5))
 NUTRIENT_MIX_SECONDS = max(15, min(int(os.getenv("SMARTFARM_NUTRIENT_MIX_SECONDS", "30")), 180))
-NUTRIENT_MAX_PULSES = max(1, min(int(os.getenv("SMARTFARM_NUTRIENT_MAX_PULSES", "3")), 5))
 RULE_ALERT_COOLDOWN_SECONDS = max(300, min(int(os.getenv("SMARTFARM_RULE_ALERT_COOLDOWN_SECONDS", "900")), 3600))
 
 ACTUATORS = {
@@ -837,11 +836,11 @@ def nutrient_pulse_seconds(actuator: str) -> int:
     return EC_PULSE_SECONDS if actuator == "ec" else PH_PULSE_SECONDS
 
 
-def nutrient_feedback_policy(actuator: str) -> dict[str, int]:
+def nutrient_feedback_policy(actuator: str) -> dict[str, Any]:
     return {
         "pulse_seconds": nutrient_pulse_seconds(actuator),
         "mix_seconds": NUTRIENT_MIX_SECONDS,
-        "max_pulses": NUTRIENT_MAX_PULSES,
+        "repeat_until_target": True,
     }
 
 
@@ -889,7 +888,7 @@ def close_nutrient_session(item: dict[str, Any], status: str, operator: str, not
 
 
 def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
-    """Run a bounded, approved PE350 feedback correction. It never self-approves."""
+    """Repeat a human-approved PE350 correction until its target or a safety stop."""
     actuator = str(item["actuator"])
     label = ACTUATORS[actuator]["label"]
     started_id = f"session:{secrets.token_hex(8)}"
@@ -898,12 +897,23 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
             "command_id": started_id, "actuator": actuator,
             "requested_state": "on", "duration_seconds": nutrient_pulse_seconds(actuator),
             "source": f"feedback_session:{operator}", "result": "session_started",
-            "note": f"승인된 폐루프 보정 시작 · 최대 {NUTRIENT_MAX_PULSES}회",
+            "note": "승인된 폐루프 보정 시작 · 목표 범위까지 반복",
         })
-        for pulse in range(1, NUTRIENT_MAX_PULSES + 1):
+        pulse = 0
+        while True:
             latest = latest_with_health()
             if not latest["sensor_control_ready"]:
                 raise RuntimeError("PE350 또는 환경 센서 데이터가 지연되어 보정을 중단함")
+            if actuator == "ec" and latest.get("ec") is not None and float(latest["ec"]) > 2.0:
+                note = f"EC 상한 초과 감지: {nutrient_value_text(actuator, latest)} · A+B 추가 주입 차단"
+                store.add_event({
+                    "command_id": started_id, "actuator": actuator,
+                    "requested_state": "off", "duration_seconds": 0,
+                    "source": f"feedback_session:{operator}", "result": "safety_stop", "note": note,
+                })
+                close_nutrient_session(item, "safety_stopped", operator, note)
+                telegram_session_notice(f"⚠️ {label} 보정 안전 중단\n{note}")
+                return
             if actuator == "ph" and latest.get("ph") is not None and float(latest["ph"]) < 5.5:
                 note = f"pH 하한 아래 감지: {nutrient_value_text(actuator, latest)} · 산성액 추가 주입 차단"
                 store.add_event({
@@ -925,60 +935,23 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
                 telegram_session_notice(f"🥦 {label} 보정 완료\n{note}\n추가 주입 없이 종료했습니다.")
                 return
 
+            pulse += 1
             before = nutrient_value_text(actuator, latest)
             send_session_command(
                 actuator, "on", nutrient_pulse_seconds(actuator), operator,
-                f"보정 {pulse}/{NUTRIENT_MAX_PULSES}회 · 주입 전 {before}",
+                f"보정 {pulse}회 · 주입 전 {before}",
             )
             if stop_event.wait(nutrient_pulse_seconds(actuator) + 1):
                 close_nutrient_session(item, "interrupted", operator, "서버 종료로 보정 세션 중단")
                 return
             send_session_command(
                 "mixing", "on", NUTRIENT_MIX_SECONDS, operator,
-                f"{label} 보정 후 교반 {NUTRIENT_MIX_SECONDS}초 · {pulse}/{NUTRIENT_MAX_PULSES}회",
+                f"{label} 보정 후 교반 {NUTRIENT_MIX_SECONDS}초 · {pulse}회",
             )
             if stop_event.wait(NUTRIENT_MIX_SECONDS + 5):
                 close_nutrient_session(item, "interrupted", operator, "서버 종료로 보정 세션 중단")
                 return
 
-        latest = latest_with_health()
-        if actuator == "ph" and latest.get("ph") is not None and float(latest["ph"]) < 5.5:
-            note = f"pH 하한 아래 감지: {nutrient_value_text(actuator, latest)} · 산성액 추가 주입 차단"
-            store.add_event({
-                "command_id": started_id, "actuator": actuator,
-                "requested_state": "off", "duration_seconds": 0,
-                "source": f"feedback_session:{operator}", "result": "safety_stop", "note": note,
-            })
-            close_nutrient_session(item, "safety_stopped", operator, note)
-            telegram_session_notice(f"⚠️ {label} 보정 안전 중단\n{note}")
-            return
-        if nutrient_target_reached(actuator, latest):
-            note = f"목표 범위 도달: {nutrient_value_text(actuator, latest)}"
-            store.add_event({
-                "command_id": started_id, "actuator": actuator,
-                "requested_state": "off", "duration_seconds": 0,
-                "source": f"feedback_session:{operator}", "result": "target_reached", "note": note,
-            })
-            close_nutrient_session(item, "completed", operator, note)
-            telegram_session_notice(f"🥦 {label} 보정 완료\n{note}\n추가 주입 없이 종료했습니다.")
-            return
-        note = (
-            f"최대 {NUTRIENT_MAX_PULSES}회 보정 한도에 도달 · "
-            f"최신 {nutrient_value_text(actuator, latest)} · 현장 확인 필요"
-        )
-        store.add_event({
-            "command_id": started_id, "actuator": actuator,
-            "requested_state": "off", "duration_seconds": 0,
-            "source": f"feedback_session:{operator}", "result": "session_limit", "note": note,
-        })
-        close_nutrient_session(item, "limited", operator, note)
-        telegram_session_notice(f"⚠️ {label} 보정 중단\n{note}\n새 요청을 만들기 전에 현장을 확인해 주세요.")
-        follow_up_ids = [
-            recommendation_id for recommendation_id in create_rule_recommendations(latest)
-            if (follow_up := store.recommendation(recommendation_id)) and follow_up.get("actuator") == actuator
-        ]
-        if follow_up_ids:
-            telegram_send_approval_requests(follow_up_ids, context="보정 한도 도달 · 재승인 필요")
     except Exception as error:
         note = f"보정 세션 중단: {str(error)[:220]}"
         store.add_event({
@@ -1310,7 +1283,7 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
             "title": f"EC 낮음: A+B {EC_PULSE_SECONDS}초 보정 승인 요청",
             "rationale": (
                 f"EC {float(ec):.3f} dS/m가 하한 1.5 미만. 승인 시 A+B를 {EC_PULSE_SECONDS}초씩 "
-                f"최대 {NUTRIENT_MAX_PULSES}회 주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350으로 재확인"
+                f"주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350 재측정을 목표 범위까지 반복"
             ),
             "actuator": "ec", "requested_state": "on", "duration_seconds": EC_PULSE_SECONDS,
             "evidence": {
@@ -1324,7 +1297,7 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
             "title": f"pH 높음: 산성액 {PH_PULSE_SECONDS}초 보정 승인 요청",
             "rationale": (
                 f"pH {float(ph):.2f}가 상한 6.5 초과. 승인 시 산성 pH 조절액을 {PH_PULSE_SECONDS}초씩 "
-                f"최대 {NUTRIENT_MAX_PULSES}회 주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350으로 재확인"
+                f"주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350 재측정을 목표 범위까지 반복"
             ),
             "actuator": "ph", "requested_state": "on", "duration_seconds": PH_PULSE_SECONDS,
             "evidence": {

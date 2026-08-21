@@ -74,6 +74,12 @@ def main() -> None:
             assert server.nutrient_target_reached("ec", {"ec": 1.5})
             assert server.nutrient_target_reached("ph", {"ph": 6.5})
             assert not server.nutrient_target_reached("ph", {"ph": 5.4})
+            ec_policy = server.nutrient_feedback_policy("ec")
+            ph_policy = server.nutrient_feedback_policy("ph")
+            assert ec_policy["repeat_until_target"] is True
+            assert ph_policy["repeat_until_target"] is True
+            assert ec_policy["pulse_seconds"] == 10
+            assert ph_policy["pulse_seconds"] == 5
         finally:
             server.store, server.CONTROL_ENABLED = original_store, original_control
             server.NUTRIENT_FEEDBACK_ENABLED = original_feedback
