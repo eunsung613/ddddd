@@ -449,13 +449,13 @@ def telegram_settings_payload() -> dict[str, Any]:
     }
 
 
-def telegram_api(method: str, *, data: dict[str, Any] | None = None,
-                 files: dict[str, Any] | None = None, timeout: int = 35) -> Any:
-    config = telegram_config()
-    if not config["configured"]:
-        raise RuntimeError("Telegram bot token and chat ID are not configured")
+def telegram_bot_api(method: str, *, data: dict[str, Any] | None = None,
+                     files: dict[str, Any] | None = None, timeout: int = 35) -> Any:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("Telegram bot token is not configured")
     response = requests.post(
-        f"https://api.telegram.org/bot{config['token']}/{method}",
+        f"https://api.telegram.org/bot{token}/{method}",
         data=data, files=files, timeout=timeout,
     )
     try:
@@ -466,6 +466,13 @@ def telegram_api(method: str, *, data: dict[str, Any] | None = None,
         detail = payload.get("description") if isinstance(payload, dict) else response.text[:160]
         raise RuntimeError(f"Telegram {method} failed: {detail or response.status_code}")
     return payload.get("result")
+
+
+def telegram_api(method: str, *, data: dict[str, Any] | None = None,
+                 files: dict[str, Any] | None = None, timeout: int = 35) -> Any:
+    if not telegram_config()["configured"]:
+        raise RuntimeError("Telegram bot token and chat ID are not configured")
+    return telegram_bot_api(method, data=data, files=files, timeout=timeout)
 
 
 def telegram_send_message(text: str, reply_markup: dict[str, Any] | None = None) -> Any:
@@ -1322,6 +1329,45 @@ def openai_settings() -> dict[str, Any]:
 @app.get("/api/settings/telegram", dependencies=[Depends(require_auth)])
 def get_telegram_settings() -> dict[str, Any]:
     return telegram_settings_payload()
+
+
+@app.post(
+    "/api/settings/telegram/discover-chats",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def discover_telegram_chats() -> dict[str, Any]:
+    """List group IDs from recent bot updates without returning message text or tokens."""
+    if not os.getenv("TELEGRAM_BOT_TOKEN", "").strip():
+        raise HTTPException(409, "Save a Telegram bot token first")
+    if telegram_config()["approvals_ready"]:
+        raise HTTPException(409, "Telegram approval polling is already active; do not run group discovery")
+    try:
+        updates = telegram_bot_api(
+            "getUpdates",
+            data={"timeout": 0, "allowed_updates": json.dumps(["message", "my_chat_member"])},
+            timeout=15,
+        ) or []
+        chats: dict[str, dict[str, str]] = {}
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            message = update.get("message")
+            if not isinstance(message, dict):
+                member = update.get("my_chat_member")
+                message = member if isinstance(member, dict) else None
+            chat = message.get("chat") if isinstance(message, dict) else None
+            if not isinstance(chat, dict) or chat.get("type") not in {"group", "supergroup"}:
+                continue
+            chat_id = str(chat.get("id", ""))
+            if re.fullmatch(r"-?\d{5,20}", chat_id):
+                chats[chat_id] = {
+                    "id": chat_id,
+                    "title": str(chat.get("title") or "제목 없는 그룹")[:120],
+                    "type": str(chat["type"]),
+                }
+        return {"chats": list(chats.values())}
+    except Exception as error:
+        raise HTTPException(400, f"Telegram group search failed: {type(error).__name__}: {str(error)[:180]}") from error
 
 
 @app.put(
