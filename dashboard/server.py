@@ -1014,10 +1014,18 @@ def run_analysis() -> dict[str, Any]:
     latest = store.latest_sensor() or {}
     capture = most_recent_capture()
     try:
-        result = openai_analysis(latest, capture)
+        degraded_error = None
+        try:
+            result = openai_analysis(latest, capture)
+        except Exception as error:
+            # Keep the scheduled safety/status notification alive, but never label a
+            # deterministic fallback as an AI observation.
+            degraded_error = f"OpenAI unavailable: {type(error).__name__}: {str(error)[:180]}"
+            result = deterministic_analysis(latest, capture)
+            result["limitations"] = list(result.get("limitations", [])) + [degraded_error]
         analysis_id = store.add_analysis(result)
         recommendation_ids = create_rule_recommendations(latest)
-        store.workflow("ai_analysis", "success", f"analysis={analysis_id}")
+        store.workflow("ai_analysis", "degraded" if degraded_error else "success", f"analysis={analysis_id}; {degraded_error or 'OpenAI success'}")
         return {"id": analysis_id, "recommendation_ids": recommendation_ids, **result}
     except Exception as error:
         store.workflow("ai_analysis", "failed", str(error))
@@ -1061,7 +1069,7 @@ def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], cap
     observation = "; ".join(str(item) for item in analysis.get("observations", [])[:2]) or "사진 기반 관찰 기록 없음"
     return (
         f"🥦 12시 브로콜리 상태 · {datetime.now(SEOUL).strftime('%Y-%m-%d %H:%M')} KST\n"
-        f"AI 관찰: {analysis.get('overall_status', '판단 불가')} · 확신도 {analysis.get('confidence', '낮음')}\n"
+        f"분석: {analysis.get('model', 'rule-engine:no-ai')} · {analysis.get('overall_status', '판단 불가')} · 확신도 {analysis.get('confidence', '낮음')}\n"
         f"요약: {analysis.get('summary', '분석 결과 없음')}\n"
         f"실측({source}): {' · '.join(values)}\n"
         f"사진: {'첨부됨' if capture_available else '없음'} | 관찰: {observation}\n"

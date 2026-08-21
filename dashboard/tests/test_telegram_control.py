@@ -49,7 +49,7 @@ def main():
         },
         True,
     )
-    for expected in ("AI 관찰", "실측(서버 실측(Pico USB))", "사진: 첨부됨", "SCD40 미설치"):
+    for expected in ("분석:", "실측(서버 실측(Pico USB))", "사진: 첨부됨", "SCD40 미설치"):
         if expected not in caption:
             raise AssertionError("caption omitted {!r}".format(expected))
     print("Telegram control tests passed")
