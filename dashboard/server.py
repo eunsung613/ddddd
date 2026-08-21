@@ -657,7 +657,7 @@ def process_serial_line(line: str) -> None:
         actuator = ack.get("actuator")
         state = ack.get("state")
         if actuator in ACTUATORS and state in ("on", "off"):
-            result = "pico_ack" if ack.get("result") == "ok" else "pico_error"
+            result = "pico_ack" if ack.get("result") == "ok" else "pico_timeout" if ack.get("result") == "timeout_off" else "pico_error"
             command_id = str(ack.get("cmd_id") or f"pico:{actuator}:{int(time.time())}")
             store.add_event({
                 "command_id": command_id,
@@ -882,6 +882,12 @@ def telegram_session_notice(message: str) -> None:
         store.workflow("nutrient_feedback_notice", "failed", f"{type(error).__name__}: {str(error)[:180]}")
 
 
+def close_nutrient_session(item: dict[str, Any], status: str, operator: str, note: str) -> None:
+    recommendation_id = item.get("id")
+    if isinstance(recommendation_id, int):
+        store.decide_recommendation(recommendation_id, status, operator, note)
+
+
 def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
     """Run a bounded, approved PE350 feedback correction. It never self-approves."""
     actuator = str(item["actuator"])
@@ -905,6 +911,7 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
                     "requested_state": "off", "duration_seconds": 0,
                     "source": f"feedback_session:{operator}", "result": "safety_stop", "note": note,
                 })
+                close_nutrient_session(item, "safety_stopped", operator, note)
                 telegram_session_notice(f"⚠️ {label} 보정 안전 중단\n{note}")
                 return
             if nutrient_target_reached(actuator, latest):
@@ -914,6 +921,7 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
                     "requested_state": "off", "duration_seconds": 0,
                     "source": f"feedback_session:{operator}", "result": "target_reached", "note": note,
                 })
+                close_nutrient_session(item, "completed", operator, note)
                 telegram_session_notice(f"🥦 {label} 보정 완료\n{note}\n추가 주입 없이 종료했습니다.")
                 return
 
@@ -923,12 +931,14 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
                 f"보정 {pulse}/{NUTRIENT_MAX_PULSES}회 · 주입 전 {before}",
             )
             if stop_event.wait(nutrient_pulse_seconds(actuator) + 1):
+                close_nutrient_session(item, "interrupted", operator, "서버 종료로 보정 세션 중단")
                 return
             send_session_command(
                 "mixing", "on", NUTRIENT_MIX_SECONDS, operator,
                 f"{label} 보정 후 교반 {NUTRIENT_MIX_SECONDS}초 · {pulse}/{NUTRIENT_MAX_PULSES}회",
             )
             if stop_event.wait(NUTRIENT_MIX_SECONDS + 5):
+                close_nutrient_session(item, "interrupted", operator, "서버 종료로 보정 세션 중단")
                 return
 
         latest = latest_with_health()
@@ -941,6 +951,7 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
             "requested_state": "off", "duration_seconds": 0,
             "source": f"feedback_session:{operator}", "result": "session_limit", "note": note,
         })
+        close_nutrient_session(item, "limited", operator, note)
         telegram_session_notice(f"⚠️ {label} 보정 중단\n{note}\n새 요청을 만들기 전에 현장을 확인해 주세요.")
     except Exception as error:
         note = f"보정 세션 중단: {str(error)[:220]}"
@@ -950,6 +961,7 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
             "source": f"feedback_session:{operator}", "result": "session_blocked", "note": note,
         })
         store.workflow("nutrient_feedback", "failed", note)
+        close_nutrient_session(item, "blocked", operator, note)
         telegram_session_notice(f"⚠️ {label} 보정 세션이 안전상 중단되었습니다.\n현장과 대시보드 기록을 확인해 주세요.")
     finally:
         nutrient_session_lock.release()
@@ -1265,7 +1277,7 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
     if NUTRIENT_FEEDBACK_ENABLED and ec is not None and float(ec) < 1.5:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
-            "title": "EC 낮음: A+B 양액 보정 승인 요청",
+            "title": f"EC 낮음: A+B {EC_PULSE_SECONDS}초 보정 승인 요청",
             "rationale": (
                 f"EC {float(ec):.3f} dS/m가 하한 1.5 미만. 승인 시 A+B를 {EC_PULSE_SECONDS}초씩 "
                 f"최대 {NUTRIENT_MAX_PULSES}회 주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350으로 재확인"
@@ -1279,7 +1291,7 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
     if NUTRIENT_FEEDBACK_ENABLED and ph is not None and float(ph) > 6.5:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
-            "title": "pH 높음: 산성액 보정 승인 요청",
+            "title": f"pH 높음: 산성액 {PH_PULSE_SECONDS}초 보정 승인 요청",
             "rationale": (
                 f"pH {float(ph):.2f}가 상한 6.5 초과. 승인 시 산성 pH 조절액을 {PH_PULSE_SECONDS}초씩 "
                 f"최대 {NUTRIENT_MAX_PULSES}회 주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350으로 재확인"

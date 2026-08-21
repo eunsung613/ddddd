@@ -208,10 +208,10 @@ def generate_daily_pdf(
     }
     result_labels = {
         "requested": "요청", "approved": "승인", "rejected": "거절", "blocked": "안전 차단",
-        "sent": "Pico 전송", "pico_ack": "Pico 확인", "pico_error": "Pico 오류",
+        "sent": "Pico 전송", "pico_ack": "Pico 확인", "pico_timeout": "시간 종료", "pico_error": "Pico 오류",
         "failed": "전송 실패", "simulated": "잠금·모의", "session_started": "보정 시작",
         "target_reached": "목표 도달", "session_limit": "횟수 제한", "session_blocked": "세션 중단",
-        "safety_stop": "안전 중단", "superseded": "정책 교체",
+        "safety_stop": "안전 중단", "superseded": "정책 교체", "safety_stopped": "안전 중단",
     }
     events = actuator_events or []
     if events:
