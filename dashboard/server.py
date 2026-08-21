@@ -403,7 +403,7 @@ def telegram_approver_ids(value: str | None = None) -> set[int]:
     raw = (value if value is not None else os.getenv("TELEGRAM_APPROVER_USER_IDS", "")).strip()
     if not raw:
         return set()
-    parts = [part.strip() for part in raw.split(",")]
+    parts = [part.strip() for part in re.split(r"[\s,]+", raw) if part.strip()]
     if not all(re.fullmatch(r"\d{4,20}", part) for part in parts):
         raise ValueError("Approver user IDs must be comma-separated positive numeric Telegram IDs")
     return {int(part) for part in parts}
