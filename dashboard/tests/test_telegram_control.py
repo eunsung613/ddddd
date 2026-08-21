@@ -45,13 +45,17 @@ def main():
             "confidence": "중간",
             "summary": "습도가 기준보다 높음",
             "observations": ["잎 상태를 사진으로 관찰"],
-            "limitations": ["SCD40 미설치"],
+            "limitations": ["SCD40 미설치", "OpenAI unavailable: RateLimitError: HTTP 429"],
+            "model": "rule-engine:no-ai",
         },
         True,
     )
-    for expected in ("분석:", "실측(서버 실측(Pico USB))", "사진: 첨부됨", "SCD40 미설치"):
+    for expected in ("🥦 브로콜리 | 오늘의 상태", "🟠 상태: 주의", "🌡 환경 (Pico 센서 실측)", "📷 최신 사진: 첨부됨", "🤖 분석 방식: 기본 안전 분석"):
         if expected not in caption:
             raise AssertionError("caption omitted {!r}".format(expected))
+    for hidden in ("OpenAI", "RateLimitError", "HTTP 429", "rule-engine:no-ai"):
+        if hidden in caption:
+            raise AssertionError("caption exposed technical detail {!r}".format(hidden))
     print("Telegram control tests passed")
 
 

@@ -1057,24 +1057,48 @@ def parse_telegram_callback(value: str) -> tuple[str, int]:
     return ("approve" if match.group(1) == "a" else "reject", int(match.group(2)))
 
 
+_TELEGRAM_TECHNICAL_TEXT = re.compile(
+    r"(?:openai|ratelimit|rate\s*limit|exception|error|traceback|status\s*code|http\s*\d{3}|\b[45]\d\d\b)",
+    re.IGNORECASE,
+)
+
+
+def telegram_public_text(value: Any, fallback: str) -> str:
+    """Return a short human-facing sentence without implementation error details."""
+    text = " ".join(str(value or "").split())
+    if not text or _TELEGRAM_TECHNICAL_TEXT.search(text):
+        return fallback
+    return text[:180]
+
+
 def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], capture_available: bool) -> str:
-    source = "서버 실측(Pico USB)" if str(latest.get("source", "")).startswith("measured") else "모의/출처 확인 필요"
-    values = [
-        f"기온 {latest.get('air_temp', '--')}°C",
-        f"습도 {latest.get('humidity', '--')}%",
-        f"EC {latest.get('ec', '--')} dS/m",
-        f"pH {latest.get('ph', '--')}",
+    measured = str(latest.get("source", "")).startswith("measured")
+    source = "Pico 센서 실측" if measured else "모의값 · 현장 확인 필요"
+    status = str(analysis.get("overall_status") or "판단 불가")
+    status_icon = {"정상": "🟢", "주의": "🟠", "경고": "🔴"}.get(status, "⚪")
+    summary = telegram_public_text(analysis.get("summary"), "환경·사진 근거를 확인해 주세요.")
+    public_notes = [
+        telegram_public_text(item, "")
+        for item in [*analysis.get("observations", []), *analysis.get("limitations", [])]
     ]
-    limitations = "; ".join(str(item) for item in analysis.get("limitations", [])[:2]) or "사진과 센서 근거를 함께 확인하세요."
-    observation = "; ".join(str(item) for item in analysis.get("observations", [])[:2]) or "사진 기반 관찰 기록 없음"
+    public_notes = [item for item in public_notes if item]
+    field_check = public_notes[0] if public_notes else "잎·배지·양액 상태를 현장에서 함께 확인해 주세요."
+    model = str(analysis.get("model") or "")
+    analysis_mode = "기본 안전 분석" if model == "rule-engine:no-ai" else "AI 사진·환경 분석"
+
     return (
-        f"🥦 12시 브로콜리 상태 · {datetime.now(SEOUL).strftime('%Y-%m-%d %H:%M')} KST\n"
-        f"분석: {analysis.get('model', 'rule-engine:no-ai')} · {analysis.get('overall_status', '판단 불가')} · 확신도 {analysis.get('confidence', '낮음')}\n"
-        f"요약: {analysis.get('summary', '분석 결과 없음')}\n"
-        f"실측({source}): {' · '.join(values)}\n"
-        f"사진: {'첨부됨' if capture_available else '없음'} | 관찰: {observation}\n"
-        f"한계/현장 확인: {limitations}\n"
-        "승인 버튼은 제안 검토용입니다. 승인 뒤에도 센서 신선도·최대시간·Pico 안전검사를 통과해야 실행됩니다."
+        "🥦 브로콜리 | 오늘의 상태\n"
+        f"🕛 {datetime.now(SEOUL).strftime('%Y-%m-%d %H:%M')} KST\n\n"
+        f"{status_icon} 상태: {status}\n"
+        f"📝 {summary}\n\n"
+        f"🌡 환경 ({source})\n"
+        f"   {latest.get('air_temp', '--')}°C · 습도 {latest.get('humidity', '--')}%\n"
+        f"🧪 양액 ({source})\n"
+        f"   EC {latest.get('ec', '--')} dS/m · pH {latest.get('ph', '--')}\n"
+        f"📷 최신 사진: {'첨부됨' if capture_available else '없음'}\n"
+        f"🤖 분석 방식: {analysis_mode}\n"
+        f"🔎 현장 확인: {field_check}\n\n"
+        "제안이 있을 때만 아래 승인 버튼이 표시됩니다."
     )
 
 
