@@ -67,6 +67,10 @@ def main() -> None:
             assert len(nutrient_ids) == 2
             proposed = [store.recommendation(item_id)["actuator"] for item_id in nutrient_ids]
             assert proposed == ["ec", "ph"]
+            store.decide_recommendation(nutrient_ids[0], "limited", "telegram:123", "보정 한도 도달")
+            follow_up_ids = server.create_rule_recommendations({"ec": 1.1, "ph": 6.9})
+            assert len(follow_up_ids) == 1
+            assert store.recommendation(follow_up_ids[0])["actuator"] == "ec"
             assert server.nutrient_target_reached("ec", {"ec": 1.5})
             assert server.nutrient_target_reached("ph", {"ph": 6.5})
             assert not server.nutrient_target_reached("ph", {"ph": 5.4})

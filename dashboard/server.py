@@ -942,6 +942,26 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
                 return
 
         latest = latest_with_health()
+        if actuator == "ph" and latest.get("ph") is not None and float(latest["ph"]) < 5.5:
+            note = f"pH 하한 아래 감지: {nutrient_value_text(actuator, latest)} · 산성액 추가 주입 차단"
+            store.add_event({
+                "command_id": started_id, "actuator": actuator,
+                "requested_state": "off", "duration_seconds": 0,
+                "source": f"feedback_session:{operator}", "result": "safety_stop", "note": note,
+            })
+            close_nutrient_session(item, "safety_stopped", operator, note)
+            telegram_session_notice(f"⚠️ {label} 보정 안전 중단\n{note}")
+            return
+        if nutrient_target_reached(actuator, latest):
+            note = f"목표 범위 도달: {nutrient_value_text(actuator, latest)}"
+            store.add_event({
+                "command_id": started_id, "actuator": actuator,
+                "requested_state": "off", "duration_seconds": 0,
+                "source": f"feedback_session:{operator}", "result": "target_reached", "note": note,
+            })
+            close_nutrient_session(item, "completed", operator, note)
+            telegram_session_notice(f"🥦 {label} 보정 완료\n{note}\n추가 주입 없이 종료했습니다.")
+            return
         note = (
             f"최대 {NUTRIENT_MAX_PULSES}회 보정 한도에 도달 · "
             f"최신 {nutrient_value_text(actuator, latest)} · 현장 확인 필요"
@@ -953,6 +973,12 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
         })
         close_nutrient_session(item, "limited", operator, note)
         telegram_session_notice(f"⚠️ {label} 보정 중단\n{note}\n새 요청을 만들기 전에 현장을 확인해 주세요.")
+        follow_up_ids = [
+            recommendation_id for recommendation_id in create_rule_recommendations(latest)
+            if (follow_up := store.recommendation(recommendation_id)) and follow_up.get("actuator") == actuator
+        ]
+        if follow_up_ids:
+            telegram_send_approval_requests(follow_up_ids, context="보정 한도 도달 · 재승인 필요")
     except Exception as error:
         note = f"보정 세션 중단: {str(error)[:220]}"
         store.add_event({
@@ -1316,12 +1342,15 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
         record_decision_event(pending, int(pending["id"]), "superseded", "system", note)
     recommendation_history = store.recommendations(200)
     pending_titles = {item["title"] for item in recommendation_history if item["status"] == "pending"}
-    deferred_titles = {item["title"] for item in recommendation_history if item["status"] == "deferred"}
+    retry_titles = {
+        item["title"] for item in recommendation_history
+        if item["status"] in {"deferred", "limited"}
+    }
     created = []
     for item in candidates:
         if item["title"] in pending_titles:
             continue
-        if item["title"] not in deferred_titles and not rule_alert_allowed(item["title"]):
+        if item["title"] not in retry_titles and not rule_alert_allowed(item["title"]):
             continue
         recommendation_id = add_actuator_recommendation(item)
         store.set_settings({"rule_alert:" + item["title"]: datetime.now(SEOUL).isoformat(timespec="seconds")})
