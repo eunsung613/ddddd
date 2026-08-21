@@ -608,6 +608,15 @@ def reconcile_led_schedule(force: bool = False) -> dict[str, Any]:
     except (RuntimeError, serial.SerialException, OSError) as error:
         message = str(error)
         update_runtime(led_schedule_error=message)
+        store.add_event({
+            "command_id": command_id,
+            "actuator": "led",
+            "requested_state": desired,
+            "duration_seconds": duration,
+            "source": "fixed_led_schedule",
+            "result": "failed",
+            "note": message,
+        })
         store.workflow("led_photoperiod", "failed", message)
         return {**led_schedule_config(), "result": "failed"}
 
@@ -635,7 +644,22 @@ def process_serial_line(line: str) -> None:
             sensor_errors=sensor_errors,
         )
     elif line.startswith("ACK_JSON:"):
-        update_runtime(last_ack=json.loads(line.split(":", 1)[1]))
+        ack = json.loads(line.split(":", 1)[1])
+        update_runtime(last_ack=ack)
+        actuator = ack.get("actuator")
+        state = ack.get("state")
+        if actuator in ACTUATORS and state in ("on", "off"):
+            result = "pico_ack" if ack.get("result") == "ok" else "pico_error"
+            command_id = str(ack.get("cmd_id") or f"pico:{actuator}:{int(time.time())}")
+            store.add_event({
+                "command_id": command_id,
+                "actuator": actuator,
+                "requested_state": state,
+                "duration_seconds": 0,
+                "source": "pico_ack",
+                "result": result,
+                "note": "Pico 응답: " + str(ack.get("result", "unknown")),
+            })
     elif line.startswith("TELEMETRY_ERROR:"):
         payload = json.loads(line.split(":", 1)[1])
         update_runtime(last_error=payload.get("error", "Pico telemetry error"))
@@ -758,6 +782,38 @@ def send_pico_command(command: dict[str, Any]) -> None:
         serial_connection.write(("CMD_JSON:" + json.dumps(command) + "\r\n").encode("utf-8"))
 
 
+def add_actuator_recommendation(item: dict[str, Any]) -> int:
+    """Create an approval request and its immutable first audit entry together."""
+    recommendation_id = store.add_recommendation(item)
+    actuator = item.get("actuator")
+    if actuator in ACTUATORS:
+        store.add_event({
+            "command_id": f"request:{recommendation_id}",
+            "actuator": actuator,
+            "requested_state": str(item.get("requested_state") or "off"),
+            "duration_seconds": int(item.get("duration_seconds") or 0),
+            "source": f"proposal:{item.get('source', 'unknown')}",
+            "result": "requested",
+            "note": str(item.get("rationale") or item.get("title") or "제어 요청"),
+        })
+    return recommendation_id
+
+
+def record_decision_event(item: dict[str, Any], recommendation_id: int, result: str, operator: str, note: str) -> None:
+    actuator = item.get("actuator")
+    if actuator not in ACTUATORS:
+        return
+    store.add_event({
+        "command_id": f"request:{recommendation_id}",
+        "actuator": actuator,
+        "requested_state": str(item.get("requested_state") or "off"),
+        "duration_seconds": int(item.get("duration_seconds") or 0),
+        "source": f"decision:{operator}",
+        "result": result,
+        "note": note or "사람 결정 기록",
+    })
+
+
 def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
     actuator = item.get("actuator")
     if not actuator:
@@ -772,21 +828,36 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
     duration = int(item.get("duration_seconds") or 0)
     if state == "on" and not 0 < duration <= ACTUATORS[actuator]["max_seconds"]:
         raise HTTPException(400, "Duration exceeds the safety limit")
+    command_id = secrets.token_hex(8)
     if not CONTROL_ENABLED:
-        return "simulated", "CONTROL_ENABLED=0; approval logged without hardware output"
+        note = "제어 잠금 상태라 실제 Pico 명령은 전송하지 않음"
+        store.add_event({
+            "command_id": command_id, "actuator": actuator,
+            "requested_state": state, "duration_seconds": duration,
+            "source": f"approved:{operator}", "result": "simulated", "note": note,
+        })
+        return "simulated", note
     latest = latest_with_health()
     if not latest["sensor_control_ready"]:
         raise HTTPException(409, "Required sensor evidence is incomplete or stale")
     command = {
-        "cmd_id": secrets.token_hex(8), "action": "set", "actuator": actuator,
+        "cmd_id": command_id, "action": "set", "actuator": actuator,
         "state": state, "duration_seconds": duration,
     }
-    send_pico_command(command)
-    store.add_event({
-        "command_id": command["cmd_id"], "actuator": actuator,
-        "requested_state": state, "duration_seconds": duration,
-        "source": f"approved:{operator}", "result": "sent", "note": item["rationale"],
-    })
+    try:
+        send_pico_command(command)
+        store.add_event({
+            "command_id": command["cmd_id"], "actuator": actuator,
+            "requested_state": state, "duration_seconds": duration,
+            "source": f"approved:{operator}", "result": "sent", "note": item["rationale"],
+        })
+    except (RuntimeError, serial.SerialException, OSError) as error:
+        store.add_event({
+            "command_id": command["cmd_id"], "actuator": actuator,
+            "requested_state": state, "duration_seconds": duration,
+            "source": f"approved:{operator}", "result": "failed", "note": str(error),
+        })
+        raise HTTPException(409, "Pico command was not sent") from error
     return "executed", f"Sent command {command['cmd_id']}"
 
 
@@ -800,8 +871,16 @@ def decide_recommendation(recommendation_id: int, decision: str, operator: str, 
             raise HTTPException(409, "Recommendation was already decided")
         if decision == "reject":
             store.decide_recommendation(recommendation_id, "rejected", operator, note)
+            record_decision_event(item, recommendation_id, "rejected", operator, note)
             return {"status": "rejected", "note": note}
-        status, execution_note = safe_execute(item, operator)
+        record_decision_event(item, recommendation_id, "approved", operator, note or "사람 승인")
+        try:
+            status, execution_note = safe_execute(item, operator)
+        except HTTPException as error:
+            execution_note = str(error.detail)
+            store.decide_recommendation(recommendation_id, "blocked", operator, execution_note)
+            record_decision_event(item, recommendation_id, "blocked", operator, execution_note)
+            return {"status": "blocked", "note": execution_note}
         store.decide_recommendation(recommendation_id, status, operator, execution_note)
         return {"status": status, "note": execution_note}
 
@@ -1007,7 +1086,7 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
             "evidence": {"humidity": humidity, "threshold": 80.0}, "model": None,
         })
     pending_titles = {item["title"] for item in store.recommendations() if item["status"] == "pending"}
-    return [store.add_recommendation(item) for item in candidates if item["title"] not in pending_titles]
+    return [add_actuator_recommendation(item) for item in candidates if item["title"] not in pending_titles]
 
 
 def run_analysis() -> dict[str, Any]:
@@ -1264,15 +1343,22 @@ def create_report(report_date: str | None = None, send_telegram: bool = False) -
     capture = most_recent_capture()
     capture_path = Path(capture["path"]) if capture and capture.get("path") else None
     model = analysis["model"] if analysis else "분석 기록 없음"
+    actuator_events = store.day_events(report_date)
     output = REPORT_DIR / f"broccoli_daily_{report_date}.pdf"
-    generate_daily_pdf(output, report_date, stats, analysis, capture_path, model, data_source, BASE_DIR)
+    generate_daily_pdf(
+        output, report_date, stats, analysis, capture_path, model, data_source, BASE_DIR,
+        actuator_events=actuator_events,
+    )
     telegram_status = telegram_send_report(output, f"{report_date} 브로콜리 AI 일일 생육관찰 보고서") if send_telegram else "not_requested"
     report_id = store.add_report({
         "report_date": report_date, "path": str(output), "model": model,
         "status": "created", "telegram_status": telegram_status,
     })
-    store.workflow("daily_report", "success", f"report={report_id}")
-    return {"id": report_id, "report_date": report_date, "model": model, "telegram_status": telegram_status}
+    store.workflow("daily_report", "success", f"report={report_id}; actuator_events={len(actuator_events)}")
+    return {
+        "id": report_id, "report_date": report_date, "model": model,
+        "telegram_status": telegram_status, "actuator_event_count": len(actuator_events),
+    }
 
 
 def capture_and_analyze_job() -> None:
@@ -1578,7 +1664,7 @@ def request_actuator(actuator: str, request: ManualRequest) -> dict[str, Any]:
         raise HTTPException(404, "Unknown actuator")
     if request.state == "on" and not 0 < request.duration_seconds <= ACTUATORS[actuator]["max_seconds"]:
         raise HTTPException(400, "Duration exceeds the safety limit")
-    recommendation_id = store.add_recommendation({
+    recommendation_id = add_actuator_recommendation({
         "source": "manual_dashboard", "severity": "manual", "title": f"{ACTUATORS[actuator]['label']} 수동 제어 요청",
         "rationale": f"{request.operator}: {request.reason}", "actuator": actuator,
         "requested_state": request.state, "duration_seconds": request.duration_seconds,
@@ -1596,6 +1682,11 @@ def request_actuator(actuator: str, request: ManualRequest) -> dict[str, Any]:
 @app.get("/api/recommendations", dependencies=[Depends(require_auth)])
 def recommendations() -> list[dict[str, Any]]:
     return store.recommendations()
+
+
+@app.get("/api/actuator-events", dependencies=[Depends(require_auth)])
+def actuator_events(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
+    return store.events(limit)
 
 
 @app.post("/api/recommendations/{recommendation_id}/decision", dependencies=[Depends(require_auth)])

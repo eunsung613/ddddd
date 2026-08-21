@@ -255,6 +255,24 @@ class Store:
                 ),
             )
 
+    def events(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM actuator_events ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def day_events(self, report_date: str) -> list[dict[str, Any]]:
+        """Return the complete local-day actuator audit trail for a report."""
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM actuator_events
+                   WHERE substr(created_at, 1, 10) = ?
+                   ORDER BY id ASC""",
+                (report_date,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def add_capture(self, camera_id: str, path: str | None, status: str, error: str | None) -> int:
         with self.connect() as db:
             cursor = db.execute(

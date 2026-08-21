@@ -70,6 +70,7 @@ def generate_daily_pdf(
     model: str,
     data_source: str,
     base_dir: Path,
+    actuator_events: list[dict[str, Any]] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     font = register_korean_font(base_dir)
@@ -198,9 +199,52 @@ def generate_daily_pdf(
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
+    story.append(evidence_table)
+
+    story.append(Paragraph("4. 액추에이터 제어 감사 기록", section))
+    actuator_labels = {
+        "led": "LED", "raw_water": "원수", "supply": "양액 공급",
+        "mixing": "교반", "ec": "EC 정량펌프", "ph": "pH 정량펌프", "fan": "환풍기",
+    }
+    result_labels = {
+        "requested": "요청", "approved": "승인", "rejected": "거절", "blocked": "안전 차단",
+        "sent": "Pico 전송", "pico_ack": "Pico 확인", "pico_error": "Pico 오류",
+        "failed": "전송 실패", "simulated": "잠금·모의",
+    }
+    events = actuator_events or []
+    if events:
+        event_rows = [["시각", "장치·명령", "결과", "기록 근거"]]
+        for event in events:
+            state = "ON" if event.get("requested_state") == "on" else "OFF"
+            duration = int(event.get("duration_seconds") or 0)
+            action = f"{actuator_labels.get(str(event.get('actuator')), event.get('actuator', '-'))} · {state}"
+            if duration:
+                action += f" · {duration}초"
+            result = result_labels.get(str(event.get("result")), str(event.get("result") or "기록"))
+            source = str(event.get("source") or "-")
+            note = str(event.get("note") or "-")
+            event_rows.append([
+                str(event.get("created_at") or "-")[:19].replace("T", " "),
+                Paragraph(action, small),
+                Paragraph(result, small),
+                Paragraph(f"{source}<br/>{note}", small),
+            ])
+        event_table = Table(event_rows, colWidths=[31 * mm, 42 * mm, 27 * mm, 76 * mm], repeatRows=1)
+        event_table.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), font),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dddddd")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(event_table)
+    else:
+        story.append(Paragraph("당일 기록된 액추에이터 요청·승인·전송·응답 이력이 없습니다.", normal))
+
     story.extend([
-        evidence_table,
-        Paragraph("4. 현장 확인 및 승인", section),
+        Paragraph("5. 현장 확인 및 승인", section),
         Paragraph("□ 잎 뒷면 및 생장점 육안 점검　□ 뿌리·양액 순환 점검　□ AI 제안 승인/거절 기록", normal),
         Spacer(1, 8 * mm),
         Table(
