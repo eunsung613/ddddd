@@ -12,6 +12,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import time
@@ -83,6 +84,8 @@ serial_connection: serial.Serial | None = None
 mqtt_connection: mqtt.Client | None = None
 mqtt_sequence = 0
 scheduler: BackgroundScheduler | None = None
+telegram_thread: threading.Thread | None = None
+recommendation_lock = threading.Lock()
 
 runtime_state: dict[str, Any] = {
     "pico_connected": False,
@@ -97,6 +100,8 @@ runtime_state: dict[str, Any] = {
     "mqtt_topic": None,
     "led_schedule_error": None,
     "led_schedule_last_run": None,
+    "telegram_polling": False,
+    "telegram_error": None,
 }
 
 
@@ -134,6 +139,14 @@ class LedScheduleRequest(BaseModel):
     enabled: bool
     on_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     off_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+class TelegramSettingsRequest(BaseModel):
+    bot_token: str | None = Field(default=None, max_length=300)
+    chat_id: str | None = Field(default=None, max_length=30)
+    approver_user_ids: str | None = Field(default=None, max_length=300)
+    daily_enabled: bool = False
+    approval_enabled: bool = False
 
 
 def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -> None:
@@ -383,6 +396,93 @@ def update_env_file(values: dict[str, str]) -> None:
     temporary.write_text("\n".join(updated) + "\n", encoding="utf-8")
     temporary.replace(env_path)
     os.environ.update(values)
+
+
+def telegram_approver_ids(value: str | None = None) -> set[int]:
+    """Return approved Telegram user IDs, failing closed on malformed values."""
+    raw = (value if value is not None else os.getenv("TELEGRAM_APPROVER_USER_IDS", "")).strip()
+    if not raw:
+        return set()
+    parts = [part.strip() for part in raw.split(",")]
+    if not all(re.fullmatch(r"\d{4,20}", part) for part in parts):
+        raise ValueError("Approver user IDs must be comma-separated positive numeric Telegram IDs")
+    return {int(part) for part in parts}
+
+
+def telegram_config() -> dict[str, Any]:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    try:
+        approvers = telegram_approver_ids()
+        config_error = None
+    except ValueError as error:
+        approvers = set()
+        config_error = str(error)
+    daily_enabled = os.getenv("SMARTFARM_TELEGRAM_DAILY_ENABLED", "0") == "1"
+    approval_enabled = os.getenv("SMARTFARM_TELEGRAM_APPROVAL_ENABLED", "0") == "1"
+    return {
+        "token": token,
+        "chat_id": chat_id,
+        "approvers": approvers,
+        "daily_enabled": daily_enabled,
+        "approval_enabled": approval_enabled,
+        "config_error": config_error,
+        "configured": bool(token and chat_id),
+        "approvals_ready": bool(token and chat_id and approvers and approval_enabled and not config_error),
+    }
+
+
+def telegram_settings_payload() -> dict[str, Any]:
+    config = telegram_config()
+    return {
+        "configured": config["configured"],
+        "bot_token_saved": bool(config["token"]),
+        "chat_id_saved": bool(config["chat_id"]),
+        "approver_count": len(config["approvers"]),
+        "daily_enabled": config["daily_enabled"],
+        "approval_enabled": config["approval_enabled"],
+        "approvals_ready": config["approvals_ready"],
+        "config_error": config["config_error"],
+        "polling": bool(runtime_state.get("telegram_polling")),
+        "last_error": runtime_state.get("telegram_error"),
+        "timezone": "Asia/Seoul",
+    }
+
+
+def telegram_api(method: str, *, data: dict[str, Any] | None = None,
+                 files: dict[str, Any] | None = None, timeout: int = 35) -> Any:
+    config = telegram_config()
+    if not config["configured"]:
+        raise RuntimeError("Telegram bot token and chat ID are not configured")
+    response = requests.post(
+        f"https://api.telegram.org/bot{config['token']}/{method}",
+        data=data, files=files, timeout=timeout,
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not response.ok or not isinstance(payload, dict) or not payload.get("ok"):
+        detail = payload.get("description") if isinstance(payload, dict) else response.text[:160]
+        raise RuntimeError(f"Telegram {method} failed: {detail or response.status_code}")
+    return payload.get("result")
+
+
+def telegram_send_message(text: str, reply_markup: dict[str, Any] | None = None) -> Any:
+    config = telegram_config()
+    data: dict[str, Any] = {"chat_id": config["chat_id"], "text": text[:4096]}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    return telegram_api("sendMessage", data=data)
+
+
+def telegram_send_photo(path: Path, caption: str, reply_markup: dict[str, Any] | None = None) -> Any:
+    config = telegram_config()
+    data: dict[str, Any] = {"chat_id": config["chat_id"], "caption": caption[:1024]}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    with path.open("rb") as photo:
+        return telegram_api("sendPhoto", data=data, files={"photo": photo})
 
 
 def time_minutes(value: str) -> int:
@@ -664,6 +764,22 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
     return "executed", f"Sent command {command['cmd_id']}"
 
 
+def decide_recommendation(recommendation_id: int, decision: str, operator: str, note: str = "") -> dict[str, str]:
+    """Atomically apply one human decision before a hardware command can be sent."""
+    with recommendation_lock:
+        item = store.recommendation(recommendation_id)
+        if not item:
+            raise HTTPException(404, "Recommendation not found")
+        if item["status"] != "pending":
+            raise HTTPException(409, "Recommendation was already decided")
+        if decision == "reject":
+            store.decide_recommendation(recommendation_id, "rejected", operator, note)
+            return {"status": "rejected", "note": note}
+        status, execution_note = safe_execute(item, operator)
+        store.decide_recommendation(recommendation_id, status, operator, execution_note)
+        return {"status": status, "note": execution_note}
+
+
 def camera_configs() -> list[dict[str, str]]:
     cameras = []
     for number in range(1, 5):
@@ -896,6 +1012,189 @@ def telegram_send_report(path: Path, caption: str) -> str:
     return "sent"
 
 
+def telegram_callback_data(recommendation_id: int, decision: str) -> str:
+    return f"farm:{'a' if decision == 'approve' else 'r'}:{recommendation_id}"
+
+
+def parse_telegram_callback(value: str) -> tuple[str, int]:
+    match = re.fullmatch(r"farm:([ar]):(\d{1,12})", value or "")
+    if not match:
+        raise ValueError("Unknown approval button")
+    return ("approve" if match.group(1) == "a" else "reject", int(match.group(2)))
+
+
+def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], capture_available: bool) -> str:
+    source = "서버 실측(Pico USB)" if str(latest.get("source", "")).startswith("measured") else "모의/출처 확인 필요"
+    values = [
+        f"기온 {latest.get('air_temp', '--')}°C",
+        f"습도 {latest.get('humidity', '--')}%",
+        f"EC {latest.get('ec', '--')} dS/m",
+        f"pH {latest.get('ph', '--')}",
+    ]
+    limitations = "; ".join(str(item) for item in analysis.get("limitations", [])[:2]) or "사진과 센서 근거를 함께 확인하세요."
+    observation = "; ".join(str(item) for item in analysis.get("observations", [])[:2]) or "사진 기반 관찰 기록 없음"
+    return (
+        f"🥦 12시 브로콜리 상태 · {datetime.now(SEOUL).strftime('%Y-%m-%d %H:%M')} KST\n"
+        f"AI 관찰: {analysis.get('overall_status', '판단 불가')} · 확신도 {analysis.get('confidence', '낮음')}\n"
+        f"요약: {analysis.get('summary', '분석 결과 없음')}\n"
+        f"실측({source}): {' · '.join(values)}\n"
+        f"사진: {'첨부됨' if capture_available else '없음'} | 관찰: {observation}\n"
+        f"한계/현장 확인: {limitations}\n"
+        "승인 버튼은 제안 검토용입니다. 승인 뒤에도 센서 신선도·최대시간·Pico 안전검사를 통과해야 실행됩니다."
+    )
+
+
+def telegram_approval_keyboard(recommendation_ids: list[int]) -> dict[str, Any] | None:
+    config = telegram_config()
+    if not config["approvals_ready"]:
+        return None
+    rows = []
+    for recommendation_id in recommendation_ids:
+        item = store.recommendation(recommendation_id)
+        if not item or item.get("status") != "pending" or not item.get("actuator"):
+            continue
+        label = ACTUATORS.get(str(item["actuator"]), {}).get("label", item["actuator"])
+        duration = int(item.get("duration_seconds") or 0)
+        rows.append([
+            {"text": f"✅ {label} {duration}초 승인", "callback_data": telegram_callback_data(recommendation_id, "approve")},
+            {"text": "❌ 거절", "callback_data": telegram_callback_data(recommendation_id, "reject")},
+        ])
+    return {"inline_keyboard": rows} if rows else None
+
+
+def telegram_send_approval_requests(recommendation_ids: list[int], *, context: str) -> str:
+    """Notify the approved chat of pending proposals; never send a Pico command."""
+    keyboard = telegram_approval_keyboard(recommendation_ids)
+    if not keyboard:
+        return "not_ready_or_no_pending_request"
+    try:
+        telegram_send_message(
+            f"🥦 새 제어 제안 ({context})\n"
+            "AI 관찰과 고정 안전 규칙을 근거로 생성됐습니다. 승인 뒤에도 서버와 Pico의 안전검사를 통과해야 실행됩니다.",
+            keyboard,
+        )
+        store.workflow("telegram_approval_request", "success", f"context={context}; ids={recommendation_ids}")
+        return "sent"
+    except Exception as error:
+        store.workflow("telegram_approval_request", "failed", f"{type(error).__name__}: {str(error)[:300]}")
+        update_runtime(telegram_error=f"approval notification: {type(error).__name__}: {str(error)[:160]}")
+        return "failed"
+
+
+def telegram_daily_brief_job() -> dict[str, Any]:
+    """Capture, observe, and send a noon status. It never executes a command itself."""
+    config = telegram_config()
+    if not config["daily_enabled"]:
+        return {"status": "disabled"}
+    if not config["configured"]:
+        store.workflow("telegram_daily_brief", "skipped", "Telegram token or chat ID is not configured")
+        return {"status": "not_configured"}
+    try:
+        captures = capture_cameras()
+        analysis = run_analysis()
+        capture = most_recent_capture()
+        capture_path = Path(capture["path"]) if capture and capture.get("path") else None
+        latest = latest_with_health()
+        keyboard = telegram_approval_keyboard(analysis.get("recommendation_ids", []))
+        caption = telegram_daily_caption(latest, analysis, bool(capture_path and capture_path.exists()))
+        if capture_path and capture_path.exists():
+            telegram_send_photo(capture_path, caption, keyboard)
+        else:
+            telegram_send_message(caption, keyboard)
+        store.workflow(
+            "telegram_daily_brief", "success",
+            f"captures={sum(row['status'] == 'success' for row in captures)}; analysis={analysis['id']}",
+        )
+        return {"status": "sent", "analysis": analysis, "captures": captures}
+    except Exception as error:
+        store.workflow("telegram_daily_brief", "failed", f"{type(error).__name__}: {str(error)[:300]}")
+        raise
+
+
+def recommendation_is_fresh(item: dict[str, Any]) -> bool:
+    try:
+        created_at = datetime.fromisoformat(str(item["created_at"]))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=SEOUL)
+        ttl = int(os.getenv("SMARTFARM_TELEGRAM_APPROVAL_TTL_SECONDS", "600"))
+        return datetime.now(SEOUL) - created_at.astimezone(SEOUL) <= timedelta(seconds=max(30, min(ttl, 3600)))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def process_telegram_callback(callback: dict[str, Any]) -> None:
+    config = telegram_config()
+    callback_id = str(callback.get("id", ""))
+
+    def answer(message: str, alert: bool = False) -> None:
+        if callback_id:
+            telegram_api("answerCallbackQuery", data={"callback_query_id": callback_id, "text": message[:200], "show_alert": alert})
+
+    try:
+        chat_id = str(((callback.get("message") or {}).get("chat") or {}).get("id", ""))
+        user_id = int((callback.get("from") or {}).get("id"))
+        if not config["approvals_ready"]:
+            raise PermissionError("Telegram approval is not configured")
+        if chat_id != config["chat_id"]:
+            raise PermissionError("This chat is not permitted")
+        if user_id not in config["approvers"]:
+            raise PermissionError("You are not an approved operator")
+        decision, recommendation_id = parse_telegram_callback(str(callback.get("data", "")))
+        item = store.recommendation(recommendation_id)
+        if not item or item.get("status") != "pending":
+            raise ValueError("This request was already processed")
+        if not recommendation_is_fresh(item):
+            raise ValueError("This approval request has expired; create a new request")
+        result = decide_recommendation(recommendation_id, decision, f"telegram:{user_id}", "Telegram inline approval")
+        answer(f"{result['status']}: #{recommendation_id}")
+        telegram_send_message(f"#{recommendation_id} {result['status']} · {result['note']}")
+    except (HTTPException, PermissionError, TypeError, ValueError) as error:
+        answer(str(getattr(error, "detail", error)), alert=True)
+    except Exception as error:
+        update_runtime(telegram_error=f"callback failed: {type(error).__name__}: {str(error)[:160]}")
+        try:
+            answer("처리 중 오류가 발생했습니다. 대시보드에서 상태를 확인하세요.", alert=True)
+        except Exception:
+            pass
+
+
+def telegram_poll_worker() -> None:
+    """Long-poll approval buttons without exposing a webhook or dashboard port."""
+    bootstrap = True
+    while not stop_event.is_set():
+        config = telegram_config()
+        if not config["approvals_ready"]:
+            update_runtime(telegram_polling=False)
+            stop_event.wait(3)
+            continue
+        try:
+            saved_offset = store.setting("telegram_update_offset")
+            offset = int(saved_offset) if saved_offset and saved_offset.isdigit() else None
+            data: dict[str, Any] = {"timeout": 20, "allowed_updates": json.dumps(["callback_query"])}
+            if offset is not None:
+                data["offset"] = offset
+            elif bootstrap:
+                data["offset"] = -1
+            updates = telegram_api("getUpdates", data=data, timeout=30) or []
+            update_runtime(telegram_polling=True, telegram_error=None)
+            if bootstrap:
+                for update in updates:
+                    if isinstance(update, dict) and isinstance(update.get("update_id"), int):
+                        store.set_settings({"telegram_update_offset": str(update["update_id"] + 1)})
+                bootstrap = False
+                continue
+            for update in updates:
+                if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+                    continue
+                store.set_settings({"telegram_update_offset": str(update["update_id"] + 1)})
+                callback = update.get("callback_query")
+                if isinstance(callback, dict):
+                    process_telegram_callback(callback)
+        except Exception as error:
+            update_runtime(telegram_polling=False, telegram_error=f"Telegram polling: {type(error).__name__}: {str(error)[:180]}")
+            stop_event.wait(10)
+
+
 def create_report(report_date: str | None = None, send_telegram: bool = False) -> dict[str, Any]:
     report_date = report_date or date.today().isoformat()
     stats = store.day_stats(report_date)
@@ -918,7 +1217,8 @@ def create_report(report_date: str | None = None, send_telegram: bool = False) -
 
 def capture_and_analyze_job() -> None:
     capture_cameras()
-    run_analysis()
+    analysis = run_analysis()
+    telegram_send_approval_requests(analysis.get("recommendation_ids", []), context="정기 분석")
 
 
 def daily_report_job() -> None:
@@ -931,7 +1231,7 @@ def led_schedule_job() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global scheduler
+    global scheduler, telegram_thread
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     store.initialize()
     stop_event.clear()
@@ -940,6 +1240,8 @@ async def lifespan(_app: FastAPI):
     if not MQTT_SUBSCRIBE_ENABLED:
         worker = threading.Thread(target=simulation_worker if SIMULATION else serial_worker, daemon=True)
         worker.start()
+    telegram_thread = threading.Thread(target=telegram_poll_worker, daemon=True, name="telegram-approval-poll")
+    telegram_thread.start()
     scheduler = BackgroundScheduler(timezone="Asia/Seoul")
     scheduler.add_job(
         led_schedule_job,
@@ -950,8 +1252,17 @@ async def lifespan(_app: FastAPI):
         coalesce=True,
     )
     if AUTOMATION_ENABLED:
-        scheduler.add_job(capture_and_analyze_job, "cron", hour="0,6,12,18", minute=0, id="capture_analysis", max_instances=1)
+        scheduler.add_job(capture_and_analyze_job, "cron", hour="0,6,18", minute=0, id="capture_analysis", max_instances=1)
         scheduler.add_job(daily_report_job, "cron", hour=20, minute=0, id="daily_report", max_instances=1)
+    scheduler.add_job(
+        telegram_daily_brief_job,
+        "cron",
+        hour=12,
+        minute=0,
+        id="telegram_daily_brief",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
     yield
     stop_event.set()
@@ -959,6 +1270,8 @@ async def lifespan(_app: FastAPI):
         scheduler.shutdown(wait=False)
     if worker:
         worker.join(timeout=2)
+    if telegram_thread:
+        telegram_thread.join(timeout=2)
     stop_mqtt()
 
 
@@ -987,7 +1300,11 @@ def health() -> dict[str, Any]:
         "automation_enabled": AUTOMATION_ENABLED, "configured_model": OPENAI_MODEL,
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
         "led_schedule_hardware_enabled": LED_SCHEDULE_HARDWARE_ENABLED,
-        "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
+        "telegram_configured": telegram_config()["configured"],
+        "telegram_approvals_ready": telegram_config()["approvals_ready"],
+        "telegram_polling": bool(runtime_state.get("telegram_polling")),
+        "telegram_error": runtime_state.get("telegram_error"),
+        "dashboard_auth_configured": bool(os.getenv("DASHBOARD_USERNAME") and os.getenv("DASHBOARD_PASSWORD")),
         "camera_count": len(camera_configs()), "database_path": str(DB_PATH),
         "pico_error": latest.get("error"),
         "mqtt": mqtt_status,
@@ -1000,6 +1317,70 @@ def openai_settings() -> dict[str, Any]:
         "configured": bool(os.getenv("OPENAI_API_KEY")),
         "model": OPENAI_MODEL,
     }
+
+
+@app.get("/api/settings/telegram", dependencies=[Depends(require_auth)])
+def get_telegram_settings() -> dict[str, Any]:
+    return telegram_settings_payload()
+
+
+@app.put(
+    "/api/settings/telegram",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def save_telegram_settings(request: TelegramSettingsRequest) -> dict[str, Any]:
+    token = (request.bot_token or "").strip()
+    chat_id = (request.chat_id or "").strip()
+    approvers_raw = (request.approver_user_ids or "").strip()
+    if token and ("\n" in token or "\r" in token or not re.fullmatch(r"\d{5,20}:[A-Za-z0-9_-]{15,250}", token)):
+        raise HTTPException(400, "Invalid Telegram bot token format")
+    if chat_id and not re.fullmatch(r"-?\d{5,20}", chat_id):
+        raise HTTPException(400, "Telegram chat ID must be numeric")
+    try:
+        approvers = telegram_approver_ids(approvers_raw)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    effective_token = token or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    effective_chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    effective_approvers_raw = approvers_raw if request.approver_user_ids is not None else os.getenv("TELEGRAM_APPROVER_USER_IDS", "")
+    if request.approver_user_ids is None:
+        try:
+            approvers = telegram_approver_ids(effective_approvers_raw)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+    if request.approval_enabled and not (effective_token and effective_chat_id and approvers):
+        raise HTTPException(400, "Approval requires a bot token, chat ID, and at least one approved Telegram user ID")
+    values = {
+        "SMARTFARM_TELEGRAM_DAILY_ENABLED": "1" if request.daily_enabled else "0",
+        "SMARTFARM_TELEGRAM_APPROVAL_ENABLED": "1" if request.approval_enabled else "0",
+    }
+    if token:
+        values["TELEGRAM_BOT_TOKEN"] = token
+    if request.chat_id is not None:
+        values["TELEGRAM_CHAT_ID"] = chat_id
+    if request.approver_user_ids is not None:
+        values["TELEGRAM_APPROVER_USER_IDS"] = approvers_raw
+    update_env_file(values)
+    return {**telegram_settings_payload(), "message": "Telegram settings saved on the server"}
+
+
+@app.post(
+    "/api/settings/telegram/test",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def test_telegram_settings() -> dict[str, Any]:
+    if not telegram_config()["configured"]:
+        raise HTTPException(409, "Save a Telegram bot token and chat ID first")
+    try:
+        bot = telegram_api("getMe", timeout=15)
+        webhook = telegram_api("getWebhookInfo", timeout=15)
+        return {
+            "ok": True,
+            "bot_username": bot.get("username") if isinstance(bot, dict) else None,
+            "webhook_active": bool(isinstance(webhook, dict) and webhook.get("url")),
+        }
+    except Exception as error:
+        raise HTTPException(400, f"Telegram connection failed: {type(error).__name__}: {str(error)[:180]}") from error
 
 
 @app.put(
@@ -1097,7 +1478,13 @@ def request_actuator(actuator: str, request: ManualRequest) -> dict[str, Any]:
         "requested_state": request.state, "duration_seconds": request.duration_seconds,
         "evidence": {"operator": request.operator}, "model": None,
     })
-    return {"id": recommendation_id, "status": "pending", "message": "승인 대기열에 추가했습니다."}
+    telegram_status = telegram_send_approval_requests([recommendation_id], context="수동 제어 요청")
+    return {
+        "id": recommendation_id,
+        "status": "pending",
+        "telegram_status": telegram_status,
+        "message": "승인 대기열에 추가했습니다.",
+    }
 
 
 @app.get("/api/recommendations", dependencies=[Depends(require_auth)])
@@ -1107,17 +1494,9 @@ def recommendations() -> list[dict[str, Any]]:
 
 @app.post("/api/recommendations/{recommendation_id}/decision", dependencies=[Depends(require_auth)])
 def decide(recommendation_id: int, request: DecisionRequest) -> dict[str, Any]:
-    item = store.recommendation(recommendation_id)
-    if not item:
-        raise HTTPException(404, "Recommendation not found")
-    if item["status"] != "pending":
-        raise HTTPException(409, "Recommendation was already decided")
-    if request.decision == "reject":
-        store.decide_recommendation(recommendation_id, "rejected", request.operator, request.note)
-        return {"status": "rejected"}
-    status, note = safe_execute(item, request.operator)
-    store.decide_recommendation(recommendation_id, status, request.operator, note)
-    return {"status": status, "note": note}
+    if telegram_config()["approval_enabled"]:
+        raise HTTPException(409, "Final approvals are enabled only through Telegram")
+    return decide_recommendation(recommendation_id, request.decision, request.operator, request.note)
 
 
 @app.get("/api/cameras", dependencies=[Depends(require_auth)])
@@ -1209,6 +1588,15 @@ def workflow_capture_analysis() -> dict[str, Any]:
     captures = capture_cameras()
     analysis = run_analysis()
     return {"captures": captures, "analysis": analysis}
+
+
+@app.post(
+    "/api/workflows/telegram-daily-brief",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def workflow_telegram_daily_brief() -> dict[str, Any]:
+    """An explicit local test action; this sends a real Telegram message."""
+    return telegram_daily_brief_job()
 
 
 @app.get("/")
