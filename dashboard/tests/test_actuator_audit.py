@@ -44,7 +44,8 @@ def main() -> None:
         assert report_events[0]["actuator"] == "supply"
 
         original_store, original_control = server.store, server.CONTROL_ENABLED
-        server.store, server.CONTROL_ENABLED = store, False
+        original_feedback = server.NUTRIENT_FEEDBACK_ENABLED
+        server.store, server.CONTROL_ENABLED, server.NUTRIENT_FEEDBACK_ENABLED = store, False, True
         try:
             recommendation_id = server.add_actuator_recommendation({
                 "source": "deterministic_rule",
@@ -62,8 +63,16 @@ def main() -> None:
             results = [event["result"] for event in store.events(20)]
             for expected in ("requested", "approved", "simulated"):
                 assert expected in results
+            nutrient_ids = server.create_rule_recommendations({"ec": 1.1, "ph": 6.9})
+            assert len(nutrient_ids) == 2
+            proposed = [store.recommendation(item_id)["actuator"] for item_id in nutrient_ids]
+            assert proposed == ["ec", "ph"]
+            assert server.nutrient_target_reached("ec", {"ec": 1.5})
+            assert server.nutrient_target_reached("ph", {"ph": 6.5})
+            assert not server.nutrient_target_reached("ph", {"ph": 5.4})
         finally:
             server.store, server.CONTROL_ENABLED = original_store, original_control
+            server.NUTRIENT_FEEDBACK_ENABLED = original_feedback
         del store
         gc.collect()
     print("Actuator audit tests passed")

@@ -204,12 +204,14 @@ def generate_daily_pdf(
     story.append(Paragraph("4. 액추에이터 제어 감사 기록", section))
     actuator_labels = {
         "led": "LED", "raw_water": "원수", "supply": "양액 공급",
-        "mixing": "교반", "ec": "EC 정량펌프", "ph": "pH 정량펌프", "fan": "환풍기",
+        "mixing": "교반", "ec": "A+B 양액펌프", "ph": "pH 산성액펌프", "fan": "환풍기",
     }
     result_labels = {
         "requested": "요청", "approved": "승인", "rejected": "거절", "blocked": "안전 차단",
         "sent": "Pico 전송", "pico_ack": "Pico 확인", "pico_error": "Pico 오류",
-        "failed": "전송 실패", "simulated": "잠금·모의",
+        "failed": "전송 실패", "simulated": "잠금·모의", "session_started": "보정 시작",
+        "target_reached": "목표 도달", "session_limit": "횟수 제한", "session_blocked": "세션 중단",
+        "safety_stop": "안전 중단",
     }
     events = actuator_events or []
     if events:

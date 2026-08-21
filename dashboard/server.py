@@ -64,14 +64,20 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
 MQTT_MODE = "subscribe" if MQTT_SUBSCRIBE_ENABLED else "publish" if MQTT_PUBLISH_ENABLED else "off"
 SENSOR_STALE_SECONDS = 20
 SEOUL = ZoneInfo("Asia/Seoul")
+SENSOR_ALERTS_ENABLED = os.getenv("SMARTFARM_SENSOR_ALERTS_ENABLED", "0") == "1"
+NUTRIENT_FEEDBACK_ENABLED = os.getenv("SMARTFARM_NUTRIENT_FEEDBACK_ENABLED", "0") == "1"
+NUTRIENT_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_NUTRIENT_PULSE_SECONDS", "1")), 2))
+NUTRIENT_MIX_SECONDS = max(30, min(int(os.getenv("SMARTFARM_NUTRIENT_MIX_SECONDS", "60")), 180))
+NUTRIENT_MAX_PULSES = max(1, min(int(os.getenv("SMARTFARM_NUTRIENT_MAX_PULSES", "3")), 5))
+RULE_ALERT_COOLDOWN_SECONDS = max(300, min(int(os.getenv("SMARTFARM_RULE_ALERT_COOLDOWN_SECONDS", "900")), 3600))
 
 ACTUATORS = {
     "led": {"label": "LED", "max_seconds": 57600},
     "raw_water": {"label": "원수", "max_seconds": 60},
     "supply": {"label": "양액 공급", "max_seconds": 120},
     "mixing": {"label": "교반", "max_seconds": 300},
-    "ec": {"label": "EC 정량펌프", "max_seconds": 5},
-    "ph": {"label": "pH 정량펌프", "max_seconds": 5},
+    "ec": {"label": "A+B 양액펌프", "max_seconds": 5},
+    "ph": {"label": "pH 산성액펌프", "max_seconds": 5},
     "fan": {"label": "환풍기", "max_seconds": 1800},
 }
 
@@ -86,6 +92,7 @@ mqtt_sequence = 0
 scheduler: BackgroundScheduler | None = None
 telegram_thread: threading.Thread | None = None
 recommendation_lock = threading.Lock()
+nutrient_session_lock = threading.Lock()
 
 runtime_state: dict[str, Any] = {
     "pico_connected": False,
@@ -814,6 +821,133 @@ def record_decision_event(item: dict[str, Any], recommendation_id: int, result: 
     })
 
 
+def nutrient_target_reached(actuator: str, latest: dict[str, Any]) -> bool:
+    """A+B raises EC; the configured pH pump is acid only and lowers pH."""
+    if actuator == "ec":
+        value = latest.get("ec")
+        return value is not None and float(value) >= 1.5
+    if actuator == "ph":
+        value = latest.get("ph")
+        return value is not None and 5.5 <= float(value) <= 6.5
+    return False
+
+
+def nutrient_value_text(actuator: str, latest: dict[str, Any]) -> str:
+    if actuator == "ec":
+        value = latest.get("ec")
+        return f"EC {value if value is not None else '--'} dS/m"
+    value = latest.get("ph")
+    return f"pH {value if value is not None else '--'}"
+
+
+def send_session_command(actuator: str, state: str, duration_seconds: int, operator: str, note: str) -> str:
+    command_id = secrets.token_hex(8)
+    send_pico_command({
+        "cmd_id": command_id, "action": "set", "actuator": actuator,
+        "state": state, "duration_seconds": duration_seconds,
+    })
+    store.add_event({
+        "command_id": command_id, "actuator": actuator,
+        "requested_state": state, "duration_seconds": duration_seconds,
+        "source": f"feedback_session:{operator}", "result": "sent", "note": note,
+    })
+    return command_id
+
+
+def telegram_session_notice(message: str) -> None:
+    try:
+        if telegram_config()["configured"]:
+            telegram_send_message(message)
+    except Exception as error:
+        store.workflow("nutrient_feedback_notice", "failed", f"{type(error).__name__}: {str(error)[:180]}")
+
+
+def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
+    """Run a bounded, approved PE350 feedback correction. It never self-approves."""
+    actuator = str(item["actuator"])
+    label = ACTUATORS[actuator]["label"]
+    started_id = f"session:{secrets.token_hex(8)}"
+    try:
+        store.add_event({
+            "command_id": started_id, "actuator": actuator,
+            "requested_state": "on", "duration_seconds": NUTRIENT_PULSE_SECONDS,
+            "source": f"feedback_session:{operator}", "result": "session_started",
+            "note": f"승인된 폐루프 보정 시작 · 최대 {NUTRIENT_MAX_PULSES}회",
+        })
+        for pulse in range(1, NUTRIENT_MAX_PULSES + 1):
+            latest = latest_with_health()
+            if not latest["sensor_control_ready"]:
+                raise RuntimeError("PE350 또는 환경 센서 데이터가 지연되어 보정을 중단함")
+            if actuator == "ph" and latest.get("ph") is not None and float(latest["ph"]) < 5.5:
+                note = f"pH 하한 아래 감지: {nutrient_value_text(actuator, latest)} · 산성액 추가 주입 차단"
+                store.add_event({
+                    "command_id": started_id, "actuator": actuator,
+                    "requested_state": "off", "duration_seconds": 0,
+                    "source": f"feedback_session:{operator}", "result": "safety_stop", "note": note,
+                })
+                telegram_session_notice(f"⚠️ {label} 보정 안전 중단\n{note}")
+                return
+            if nutrient_target_reached(actuator, latest):
+                note = f"목표 범위 도달: {nutrient_value_text(actuator, latest)}"
+                store.add_event({
+                    "command_id": started_id, "actuator": actuator,
+                    "requested_state": "off", "duration_seconds": 0,
+                    "source": f"feedback_session:{operator}", "result": "target_reached", "note": note,
+                })
+                telegram_session_notice(f"🥦 {label} 보정 완료\n{note}\n추가 주입 없이 종료했습니다.")
+                return
+
+            before = nutrient_value_text(actuator, latest)
+            send_session_command(
+                actuator, "on", NUTRIENT_PULSE_SECONDS, operator,
+                f"보정 {pulse}/{NUTRIENT_MAX_PULSES}회 · 주입 전 {before}",
+            )
+            if stop_event.wait(NUTRIENT_PULSE_SECONDS + 1):
+                return
+            send_session_command(
+                "mixing", "on", NUTRIENT_MIX_SECONDS, operator,
+                f"{label} 보정 후 교반 {NUTRIENT_MIX_SECONDS}초 · {pulse}/{NUTRIENT_MAX_PULSES}회",
+            )
+            if stop_event.wait(NUTRIENT_MIX_SECONDS + 5):
+                return
+
+        latest = latest_with_health()
+        note = (
+            f"최대 {NUTRIENT_MAX_PULSES}회 보정 한도에 도달 · "
+            f"최신 {nutrient_value_text(actuator, latest)} · 현장 확인 필요"
+        )
+        store.add_event({
+            "command_id": started_id, "actuator": actuator,
+            "requested_state": "off", "duration_seconds": 0,
+            "source": f"feedback_session:{operator}", "result": "session_limit", "note": note,
+        })
+        telegram_session_notice(f"⚠️ {label} 보정 중단\n{note}\n새 요청을 만들기 전에 현장을 확인해 주세요.")
+    except Exception as error:
+        note = f"보정 세션 중단: {str(error)[:220]}"
+        store.add_event({
+            "command_id": started_id, "actuator": actuator,
+            "requested_state": "off", "duration_seconds": 0,
+            "source": f"feedback_session:{operator}", "result": "session_blocked", "note": note,
+        })
+        store.workflow("nutrient_feedback", "failed", note)
+        telegram_session_notice(f"⚠️ {label} 보정 세션이 안전상 중단되었습니다.\n현장과 대시보드 기록을 확인해 주세요.")
+    finally:
+        nutrient_session_lock.release()
+
+
+def start_nutrient_feedback_session(item: dict[str, Any], operator: str) -> tuple[str, str]:
+    if not NUTRIENT_FEEDBACK_ENABLED:
+        raise HTTPException(409, "Nutrient feedback control is disabled")
+    if not nutrient_session_lock.acquire(blocking=False):
+        raise HTTPException(409, "Another nutrient correction session is already running")
+    worker = threading.Thread(
+        target=run_nutrient_feedback_session, args=(item, operator), daemon=True,
+        name=f"nutrient-feedback-{item['actuator']}",
+    )
+    worker.start()
+    return "executing", "승인된 보정 세션을 시작했습니다. 주입·교반·PE350 재측정 기록을 확인하세요."
+
+
 def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
     actuator = item.get("actuator")
     if not actuator:
@@ -837,6 +971,11 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
             "source": f"approved:{operator}", "result": "simulated", "note": note,
         })
         return "simulated", note
+    if item.get("source") == "nutrient_feedback_rule":
+        latest = latest_with_health()
+        if not latest["sensor_control_ready"]:
+            raise HTTPException(409, "Required sensor evidence is incomplete or stale")
+        return start_nutrient_feedback_session(item, operator)
     latest = latest_with_health()
     if not latest["sensor_control_ready"]:
         raise HTTPException(409, "Required sensor evidence is incomplete or stale")
@@ -1068,6 +1207,21 @@ def openai_analysis(latest: dict[str, Any], capture: dict[str, Any] | None) -> d
     return result
 
 
+def rule_alert_allowed(title: str) -> bool:
+    key = "rule_alert:" + title
+    stored = store.setting(key)
+    if stored:
+        try:
+            previous = datetime.fromisoformat(stored)
+            if previous.tzinfo is None:
+                previous = previous.replace(tzinfo=SEOUL)
+            if datetime.now(SEOUL) - previous.astimezone(SEOUL) < timedelta(seconds=RULE_ALERT_COOLDOWN_SECONDS):
+                return False
+        except ValueError:
+            pass
+    return True
+
+
 def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
     candidates = []
     temp, humidity = latest.get("air_temp"), latest.get("humidity")
@@ -1085,8 +1239,38 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
             "actuator": "fan", "requested_state": "on", "duration_seconds": 300,
             "evidence": {"humidity": humidity, "threshold": 80.0}, "model": None,
         })
+    ec, ph = latest.get("ec"), latest.get("ph")
+    if NUTRIENT_FEEDBACK_ENABLED and ec is not None and float(ec) < 1.5:
+        candidates.append({
+            "source": "nutrient_feedback_rule", "severity": "warning",
+            "title": "EC 낮음: A+B 양액 보정 승인 요청",
+            "rationale": (
+                f"EC {float(ec):.3f} dS/m가 하한 1.5 미만. 승인 시 A+B를 {NUTRIENT_PULSE_SECONDS}초씩 "
+                f"최대 {NUTRIENT_MAX_PULSES}회 주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350으로 재확인"
+            ),
+            "actuator": "ec", "requested_state": "on", "duration_seconds": NUTRIENT_PULSE_SECONDS,
+            "evidence": {"ec": ec, "lower_limit": 1.5, "target": "1.5~2.0", "pump": "A+B"}, "model": None,
+        })
+    if NUTRIENT_FEEDBACK_ENABLED and ph is not None and float(ph) > 6.5:
+        candidates.append({
+            "source": "nutrient_feedback_rule", "severity": "warning",
+            "title": "pH 높음: 산성액 보정 승인 요청",
+            "rationale": (
+                f"pH {float(ph):.2f}가 상한 6.5 초과. 승인 시 산성 pH 조절액을 {NUTRIENT_PULSE_SECONDS}초씩 "
+                f"최대 {NUTRIENT_MAX_PULSES}회 주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350으로 재확인"
+            ),
+            "actuator": "ph", "requested_state": "on", "duration_seconds": NUTRIENT_PULSE_SECONDS,
+            "evidence": {"ph": ph, "upper_limit": 6.5, "target": "5.5~6.5", "pump": "acid"}, "model": None,
+        })
     pending_titles = {item["title"] for item in store.recommendations() if item["status"] == "pending"}
-    return [add_actuator_recommendation(item) for item in candidates if item["title"] not in pending_titles]
+    created = []
+    for item in candidates:
+        if item["title"] in pending_titles or not rule_alert_allowed(item["title"]):
+            continue
+        recommendation_id = add_actuator_recommendation(item)
+        store.set_settings({"rule_alert:" + item["title"]: datetime.now(SEOUL).isoformat(timespec="seconds")})
+        created.append(recommendation_id)
+    return created
 
 
 def run_analysis() -> dict[str, Any]:
@@ -1367,6 +1551,18 @@ def capture_and_analyze_job() -> None:
     telegram_send_approval_requests(analysis.get("recommendation_ids", []), context="정기 분석")
 
 
+def sensor_alert_job() -> None:
+    """Create only bounded rule proposals; Telegram approval remains mandatory."""
+    if not SENSOR_ALERTS_ENABLED:
+        return
+    latest = latest_with_health()
+    if not latest.get("sensor_control_ready"):
+        return
+    recommendation_ids = create_rule_recommendations(latest)
+    if recommendation_ids:
+        telegram_send_approval_requests(recommendation_ids, context="실시간 센서 경보")
+
+
 def daily_report_job() -> None:
     create_report(send_telegram=True)
 
@@ -1409,6 +1605,14 @@ async def lifespan(_app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
+    scheduler.add_job(
+        sensor_alert_job,
+        "interval",
+        seconds=60,
+        id="sensor_alerts",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
     yield
     stop_event.set()
@@ -1444,6 +1648,9 @@ def health() -> dict[str, Any]:
         "mqtt_error": runtime_state["mqtt_error"],
         "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED and not MQTT_SUBSCRIBE_ENABLED,
         "automation_enabled": AUTOMATION_ENABLED, "configured_model": OPENAI_MODEL,
+        "sensor_alerts_enabled": SENSOR_ALERTS_ENABLED,
+        "nutrient_feedback_enabled": NUTRIENT_FEEDBACK_ENABLED,
+        "nutrient_session_active": nutrient_session_lock.locked(),
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
         "led_schedule_hardware_enabled": LED_SCHEDULE_HARDWARE_ENABLED,
         "telegram_configured": telegram_config()["configured"],
