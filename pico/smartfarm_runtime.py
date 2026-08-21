@@ -45,7 +45,7 @@ MAX_ON_SECONDS = {
     "raw_water": 60,
     "supply": 120,
     "mixing": 300,
-    "ec": 5,
+    "ec": 10,
     "ph": 5,
     "fan": 1800,
 }

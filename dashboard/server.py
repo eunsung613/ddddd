@@ -66,8 +66,9 @@ SENSOR_STALE_SECONDS = 20
 SEOUL = ZoneInfo("Asia/Seoul")
 SENSOR_ALERTS_ENABLED = os.getenv("SMARTFARM_SENSOR_ALERTS_ENABLED", "0") == "1"
 NUTRIENT_FEEDBACK_ENABLED = os.getenv("SMARTFARM_NUTRIENT_FEEDBACK_ENABLED", "0") == "1"
-NUTRIENT_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_NUTRIENT_PULSE_SECONDS", "1")), 2))
-NUTRIENT_MIX_SECONDS = max(30, min(int(os.getenv("SMARTFARM_NUTRIENT_MIX_SECONDS", "60")), 180))
+EC_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_EC_PULSE_SECONDS", "3")), 10))
+PH_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_PH_PULSE_SECONDS", "1")), 2))
+NUTRIENT_MIX_SECONDS = max(15, min(int(os.getenv("SMARTFARM_NUTRIENT_MIX_SECONDS", "30")), 180))
 NUTRIENT_MAX_PULSES = max(1, min(int(os.getenv("SMARTFARM_NUTRIENT_MAX_PULSES", "3")), 5))
 RULE_ALERT_COOLDOWN_SECONDS = max(300, min(int(os.getenv("SMARTFARM_RULE_ALERT_COOLDOWN_SECONDS", "900")), 3600))
 
@@ -76,7 +77,7 @@ ACTUATORS = {
     "raw_water": {"label": "원수", "max_seconds": 60},
     "supply": {"label": "양액 공급", "max_seconds": 120},
     "mixing": {"label": "교반", "max_seconds": 300},
-    "ec": {"label": "A+B 양액펌프", "max_seconds": 5},
+    "ec": {"label": "A+B 양액펌프", "max_seconds": 10},
     "ph": {"label": "pH 산성액펌프", "max_seconds": 5},
     "fan": {"label": "환풍기", "max_seconds": 1800},
 }
@@ -832,6 +833,25 @@ def nutrient_target_reached(actuator: str, latest: dict[str, Any]) -> bool:
     return False
 
 
+def nutrient_pulse_seconds(actuator: str) -> int:
+    return EC_PULSE_SECONDS if actuator == "ec" else PH_PULSE_SECONDS
+
+
+def nutrient_feedback_policy(actuator: str) -> dict[str, int]:
+    return {
+        "pulse_seconds": nutrient_pulse_seconds(actuator),
+        "mix_seconds": NUTRIENT_MIX_SECONDS,
+        "max_pulses": NUTRIENT_MAX_PULSES,
+    }
+
+
+def nutrient_request_matches_policy(item: dict[str, Any]) -> bool:
+    if item.get("source") != "nutrient_feedback_rule":
+        return True
+    actuator = str(item.get("actuator") or "")
+    return actuator in ("ec", "ph") and item.get("evidence", {}).get("feedback_policy") == nutrient_feedback_policy(actuator)
+
+
 def nutrient_value_text(actuator: str, latest: dict[str, Any]) -> str:
     if actuator == "ec":
         value = latest.get("ec")
@@ -870,7 +890,7 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
     try:
         store.add_event({
             "command_id": started_id, "actuator": actuator,
-            "requested_state": "on", "duration_seconds": NUTRIENT_PULSE_SECONDS,
+            "requested_state": "on", "duration_seconds": nutrient_pulse_seconds(actuator),
             "source": f"feedback_session:{operator}", "result": "session_started",
             "note": f"승인된 폐루프 보정 시작 · 최대 {NUTRIENT_MAX_PULSES}회",
         })
@@ -899,10 +919,10 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
 
             before = nutrient_value_text(actuator, latest)
             send_session_command(
-                actuator, "on", NUTRIENT_PULSE_SECONDS, operator,
+                actuator, "on", nutrient_pulse_seconds(actuator), operator,
                 f"보정 {pulse}/{NUTRIENT_MAX_PULSES}회 · 주입 전 {before}",
             )
-            if stop_event.wait(NUTRIENT_PULSE_SECONDS + 1):
+            if stop_event.wait(nutrient_pulse_seconds(actuator) + 1):
                 return
             send_session_command(
                 "mixing", "on", NUTRIENT_MIX_SECONDS, operator,
@@ -972,6 +992,8 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
         })
         return "simulated", note
     if item.get("source") == "nutrient_feedback_rule":
+        if not nutrient_request_matches_policy(item):
+            raise HTTPException(409, "Dosing policy changed; request a fresh Telegram approval")
         latest = latest_with_health()
         if not latest["sensor_control_ready"]:
             raise HTTPException(409, "Required sensor evidence is incomplete or stale")
@@ -1245,23 +1267,37 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
             "source": "nutrient_feedback_rule", "severity": "warning",
             "title": "EC 낮음: A+B 양액 보정 승인 요청",
             "rationale": (
-                f"EC {float(ec):.3f} dS/m가 하한 1.5 미만. 승인 시 A+B를 {NUTRIENT_PULSE_SECONDS}초씩 "
+                f"EC {float(ec):.3f} dS/m가 하한 1.5 미만. 승인 시 A+B를 {EC_PULSE_SECONDS}초씩 "
                 f"최대 {NUTRIENT_MAX_PULSES}회 주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350으로 재확인"
             ),
-            "actuator": "ec", "requested_state": "on", "duration_seconds": NUTRIENT_PULSE_SECONDS,
-            "evidence": {"ec": ec, "lower_limit": 1.5, "target": "1.5~2.0", "pump": "A+B"}, "model": None,
+            "actuator": "ec", "requested_state": "on", "duration_seconds": EC_PULSE_SECONDS,
+            "evidence": {
+                "ec": ec, "lower_limit": 1.5, "target": "1.5~2.0", "pump": "A+B",
+                "feedback_policy": nutrient_feedback_policy("ec"),
+            }, "model": None,
         })
     if NUTRIENT_FEEDBACK_ENABLED and ph is not None and float(ph) > 6.5:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
             "title": "pH 높음: 산성액 보정 승인 요청",
             "rationale": (
-                f"pH {float(ph):.2f}가 상한 6.5 초과. 승인 시 산성 pH 조절액을 {NUTRIENT_PULSE_SECONDS}초씩 "
+                f"pH {float(ph):.2f}가 상한 6.5 초과. 승인 시 산성 pH 조절액을 {PH_PULSE_SECONDS}초씩 "
                 f"최대 {NUTRIENT_MAX_PULSES}회 주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350으로 재확인"
             ),
-            "actuator": "ph", "requested_state": "on", "duration_seconds": NUTRIENT_PULSE_SECONDS,
-            "evidence": {"ph": ph, "upper_limit": 6.5, "target": "5.5~6.5", "pump": "acid"}, "model": None,
+            "actuator": "ph", "requested_state": "on", "duration_seconds": PH_PULSE_SECONDS,
+            "evidence": {
+                "ph": ph, "upper_limit": 6.5, "target": "5.5~6.5", "pump": "acid",
+                "feedback_policy": nutrient_feedback_policy("ph"),
+            }, "model": None,
         })
+    for pending in store.recommendations(200):
+        if pending.get("status") != "pending" or pending.get("source") != "nutrient_feedback_rule":
+            continue
+        if nutrient_request_matches_policy(pending):
+            continue
+        note = "보정 시간 정책이 변경되어 새 텔레그램 승인 요청으로 교체"
+        store.decide_recommendation(int(pending["id"]), "superseded", "system", note)
+        record_decision_event(pending, int(pending["id"]), "superseded", "system", note)
     pending_titles = {item["title"] for item in store.recommendations() if item["status"] == "pending"}
     created = []
     for item in candidates:
