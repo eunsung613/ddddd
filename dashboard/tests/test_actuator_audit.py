@@ -45,7 +45,9 @@ def main() -> None:
 
         original_store, original_control = server.store, server.CONTROL_ENABLED
         original_feedback = server.NUTRIENT_FEEDBACK_ENABLED
+        original_supply_continuous = server.SUPPLY_CONTINUOUS_ENABLED
         server.store, server.CONTROL_ENABLED, server.NUTRIENT_FEEDBACK_ENABLED = store, False, True
+        server.SUPPLY_CONTINUOUS_ENABLED = False
         try:
             recommendation_id = server.add_actuator_recommendation({
                 "source": "deterministic_rule",
@@ -83,6 +85,7 @@ def main() -> None:
         finally:
             server.store, server.CONTROL_ENABLED = original_store, original_control
             server.NUTRIENT_FEEDBACK_ENABLED = original_feedback
+            server.SUPPLY_CONTINUOUS_ENABLED = original_supply_continuous
         del store
         gc.collect()
     print("Actuator audit tests passed")

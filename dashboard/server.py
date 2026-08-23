@@ -1036,6 +1036,8 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
     actuator = item.get("actuator")
     if not actuator:
         return "reviewed", "No actuator command was attached"
+    if actuator == "supply" and SUPPLY_CONTINUOUS_ENABLED:
+        raise HTTPException(409, "Supply circulation is fixed to continuous operation")
     if MQTT_SUBSCRIBE_ENABLED:
         raise HTTPException(409, "Remote MQTT dashboard is read-only")
     if actuator not in ACTUATORS:
@@ -1984,6 +1986,7 @@ def actuators() -> dict[str, Any]:
         states = dict(runtime_state["actuators"])
     return {"control_enabled": CONTROL_ENABLED and not MQTT_SUBSCRIBE_ENABLED,
             "chemical_control_enabled": CHEMICAL_CONTROL_ENABLED and not MQTT_SUBSCRIBE_ENABLED,
+            "supply_continuous_enabled": SUPPLY_CONTINUOUS_ENABLED,
             "items": [{"id": key, "state": states.get(key, "unknown"), **value} for key, value in ACTUATORS.items()]}
 
 
@@ -1993,6 +1996,8 @@ def request_actuator(actuator: str, request: ManualRequest) -> dict[str, Any]:
         raise HTTPException(409, "Remote MQTT dashboard is read-only")
     if actuator not in ACTUATORS:
         raise HTTPException(404, "Unknown actuator")
+    if actuator == "supply" and SUPPLY_CONTINUOUS_ENABLED:
+        raise HTTPException(409, "Supply circulation is fixed to continuous operation")
     if request.state == "on" and not 0 < request.duration_seconds <= ACTUATORS[actuator]["max_seconds"]:
         raise HTTPException(400, "Duration exceeds the safety limit")
     recommendation_id = add_actuator_recommendation({
