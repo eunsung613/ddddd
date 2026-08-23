@@ -43,7 +43,7 @@ TELEMETRY_INTERVAL_MS = 5000
 MAX_ON_SECONDS = {
     "led": 57600,
     "raw_water": 60,
-    "supply": 120,
+    "supply": 86400,
     "mixing": 300,
     "ec": 10,
     "ph": 5,

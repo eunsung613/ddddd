@@ -57,6 +57,7 @@ AUTOMATION_ENABLED = os.getenv("SMARTFARM_AUTOMATION_ENABLED", "1") == "1"
 LED_SCHEDULE_HARDWARE_ENABLED = (
     os.getenv("SMARTFARM_LED_SCHEDULE_HARDWARE_ENABLED", "0") == "1"
 )
+SUPPLY_CONTINUOUS_ENABLED = os.getenv("SMARTFARM_SUPPLY_CONTINUOUS_ENABLED", "0") == "1"
 SCD40_REQUIRED = os.getenv("SMARTFARM_SCD40_REQUIRED", "1") == "1"
 MQTT_PUBLISH_ENABLED = os.getenv("SMARTFARM_MQTT_PUBLISH_ENABLED", "0") == "1"
 MQTT_SUBSCRIBE_ENABLED = os.getenv("SMARTFARM_MQTT_SUBSCRIBE_ENABLED", "0") == "1"
@@ -74,7 +75,7 @@ RULE_ALERT_COOLDOWN_SECONDS = max(300, min(int(os.getenv("SMARTFARM_RULE_ALERT_C
 ACTUATORS = {
     "led": {"label": "LED", "max_seconds": 57600},
     "raw_water": {"label": "원수", "max_seconds": 60},
-    "supply": {"label": "양액 공급", "max_seconds": 120},
+    "supply": {"label": "양액 공급 (24시간 순환)", "max_seconds": 86400},
     "mixing": {"label": "교반", "max_seconds": 300},
     "ec": {"label": "A+B 양액펌프", "max_seconds": 10},
     "ph": {"label": "pH 산성액펌프", "max_seconds": 5},
@@ -107,6 +108,8 @@ runtime_state: dict[str, Any] = {
     "mqtt_topic": None,
     "led_schedule_error": None,
     "led_schedule_last_run": None,
+    "supply_circulation_error": None,
+    "supply_circulation_last_run": None,
     "telegram_polling": False,
     "telegram_error": None,
 }
@@ -626,6 +629,56 @@ def reconcile_led_schedule(force: bool = False) -> dict[str, Any]:
         })
         store.workflow("led_photoperiod", "failed", message)
         return {**led_schedule_config(), "result": "failed"}
+
+
+def reconcile_supply_circulation(force: bool = False) -> dict[str, Any]:
+    """Keep the nutrient delivery pump running continuously, including after reconnects."""
+    with state_lock:
+        connected = bool(runtime_state["pico_connected"])
+        current = runtime_state["actuators"].get("supply", "unknown")
+    status = {
+        "enabled": SUPPLY_CONTINUOUS_ENABLED,
+        "current_state": current,
+        "desired_state": "on" if SUPPLY_CONTINUOUS_ENABLED else "off",
+    }
+    if not SUPPLY_CONTINUOUS_ENABLED:
+        return {**status, "result": "disabled"}
+    if not CONTROL_ENABLED or MQTT_SUBSCRIBE_ENABLED:
+        message = "Continuous supply requires local hardware control"
+        update_runtime(supply_circulation_error=message)
+        return {**status, "result": "blocked", "error": message}
+    if not connected:
+        message = "Pico USB is offline"
+        update_runtime(supply_circulation_error=message)
+        return {**status, "result": "offline", "error": message}
+    if current == "on" and not force:
+        update_runtime(supply_circulation_error=None)
+        return {**status, "result": "unchanged"}
+    command_id = secrets.token_hex(8)
+    command = {
+        "cmd_id": command_id, "action": "set", "actuator": "supply",
+        "state": "on", "duration_seconds": 86400,
+    }
+    try:
+        send_pico_command(command)
+        timestamp = datetime.now(SEOUL).isoformat(timespec="seconds")
+        update_runtime(supply_circulation_error=None, supply_circulation_last_run=timestamp)
+        store.add_event({
+            "command_id": command_id, "actuator": "supply",
+            "requested_state": "on", "duration_seconds": 86400,
+            "source": "continuous_supply", "result": "sent",
+            "note": "24시간 양액 순환 유지",
+        })
+        return {**status, "result": "sent"}
+    except (RuntimeError, serial.SerialException, OSError) as error:
+        message = str(error)
+        update_runtime(supply_circulation_error=message)
+        store.add_event({
+            "command_id": command_id, "actuator": "supply",
+            "requested_state": "on", "duration_seconds": 86400,
+            "source": "continuous_supply", "result": "failed", "note": message,
+        })
+        return {**status, "result": "failed", "error": message}
 
 
 def start_pico_runtime(pico: serial.Serial) -> None:
@@ -1629,6 +1682,10 @@ def led_schedule_job() -> None:
     reconcile_led_schedule()
 
 
+def supply_circulation_job() -> None:
+    reconcile_supply_circulation()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global scheduler, telegram_thread
@@ -1660,6 +1717,14 @@ async def lifespan(_app: FastAPI):
         hour=12,
         minute=0,
         id="telegram_daily_brief",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        supply_circulation_job,
+        "interval",
+        seconds=15,
+        id="continuous_supply",
         max_instances=1,
         coalesce=True,
     )
@@ -1708,6 +1773,7 @@ def health() -> dict[str, Any]:
         "automation_enabled": AUTOMATION_ENABLED, "configured_model": OPENAI_MODEL,
         "sensor_alerts_enabled": SENSOR_ALERTS_ENABLED,
         "nutrient_feedback_enabled": NUTRIENT_FEEDBACK_ENABLED,
+        "supply_continuous_enabled": SUPPLY_CONTINUOUS_ENABLED,
         "nutrient_session_active": nutrient_session_lock.locked(),
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
         "led_schedule_hardware_enabled": LED_SCHEDULE_HARDWARE_ENABLED,
