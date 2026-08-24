@@ -65,21 +65,22 @@ def main() -> None:
             results = [event["result"] for event in store.events(20)]
             for expected in ("requested", "approved", "simulated"):
                 assert expected in results
-            nutrient_ids = server.create_rule_recommendations({"ec": 1.1, "ph": 6.9})
+            nutrient_ids = server.create_rule_recommendations({"ec": 0.9, "ph": 6.9})
             assert len(nutrient_ids) == 2
             proposed = [store.recommendation(item_id)["actuator"] for item_id in nutrient_ids]
             assert proposed == ["ec", "ph"]
             store.decide_recommendation(nutrient_ids[0], "limited", "telegram:123", "보정 한도 도달")
-            follow_up_ids = server.create_rule_recommendations({"ec": 1.1, "ph": 6.9})
+            follow_up_ids = server.create_rule_recommendations({"ec": 0.9, "ph": 6.9})
             assert len(follow_up_ids) == 1
             assert store.recommendation(follow_up_ids[0])["actuator"] == "ec"
-            assert server.nutrient_target_reached("ec", {"ec": 1.5})
-            assert server.nutrient_target_reached("ph", {"ph": 6.5})
-            assert not server.nutrient_target_reached("ph", {"ph": 5.4})
+            assert server.nutrient_target_reached("ec", {"ec": 1.3})
+            assert server.nutrient_target_reached("ph", {"ph": 6.0})
+            assert not server.nutrient_target_reached("ph", {"ph": 5.7})
             ec_policy = server.nutrient_feedback_policy("ec")
             ph_policy = server.nutrient_feedback_policy("ph")
             assert ec_policy["repeat_until_target"] is True
             assert ph_policy["repeat_until_target"] is True
+            assert ec_policy["telegram_stop_command"] == "/stop"
             assert ec_policy["pulse_seconds"] == 10
             assert ph_policy["pulse_seconds"] == 5
         finally:

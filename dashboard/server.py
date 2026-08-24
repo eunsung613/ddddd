@@ -71,6 +71,18 @@ EC_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_EC_PULSE_SECONDS", "3")),
 PH_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_PH_PULSE_SECONDS", "1")), 5))
 NUTRIENT_MIX_SECONDS = max(15, min(int(os.getenv("SMARTFARM_NUTRIENT_MIX_SECONDS", "30")), 180))
 RULE_ALERT_COOLDOWN_SECONDS = max(300, min(int(os.getenv("SMARTFARM_RULE_ALERT_COOLDOWN_SECONDS", "900")), 3600))
+DEFAULT_GROWTH_STAGE = os.getenv("SMARTFARM_DEFAULT_GROWTH_STAGE", "육묘기").strip() or "육묘기"
+
+# Profiles are conservative nutrient-solution operating bands.  An AI image
+# observation can select a profile, but it never sends a relay command itself.
+GROWTH_STAGE_PROFILES = {
+    "육묘기": {"ec_low": 1.0, "ec_target": 1.3, "ec_high": 1.5, "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.2},
+    "활착기": {"ec_low": 1.3, "ec_target": 1.5, "ec_high": 1.8, "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.3},
+    "생육기": {"ec_low": 1.8, "ec_target": 2.2, "ec_high": 2.6, "ph_low": 5.9, "ph_target": 6.1, "ph_high": 6.4},
+    "수확전": {"ec_low": 2.5, "ec_target": 3.0, "ec_high": 3.5, "ph_low": 6.0, "ph_target": 6.2, "ph_high": 6.6},
+}
+if DEFAULT_GROWTH_STAGE not in GROWTH_STAGE_PROFILES:
+    DEFAULT_GROWTH_STAGE = "육묘기"
 
 ACTUATORS = {
     "led": {"label": "LED", "max_seconds": 57600},
@@ -94,6 +106,8 @@ scheduler: BackgroundScheduler | None = None
 telegram_thread: threading.Thread | None = None
 recommendation_lock = threading.Lock()
 nutrient_session_lock = threading.Lock()
+nutrient_session_cancel = threading.Event()
+nutrient_session_state: dict[str, Any] = {"actuator": None, "operator": None}
 
 runtime_state: dict[str, Any] = {
     "pico_connected": False,
@@ -540,10 +554,14 @@ def telegram_status_text() -> str:
     sensor_note = "정상" if latest.get("pe350_connected") else "PE350 데이터 확인 필요"
     if latest.get("sensor_errors"):
         sensor_note += " · 일부 센서 오류"
+    analysis_row = (store.analyses(1) or [{}])[0]
+    analysis = dict(analysis_row.get("result") or {})
+    stage, profile = growth_stage_profile(analysis)
     return (
         "🥦 브로콜리 현재 상태\n"
         f"🕛 {datetime.now(SEOUL).strftime('%Y-%m-%d %H:%M')} KST\n\n"
         f"🧪 EC {latest.get('ec', '--')} dS/m · pH {latest.get('ph', '--')} · 양액 {latest.get('solution_temp', '--')}°C\n"
+        f"🌱 단계: {stage} · 목표 EC {profile['ec_target']:.1f} · pH {profile['ph_target']:.1f}\n"
         f"🌡 공기 {latest.get('air_temp', '--')}°C · 습도 {latest.get('humidity', '--')}%\n"
         f"🔄 공급 펌프: {str(actuators.get('supply', 'unknown')).upper()} (24시간 순환)\n"
         f"⚙️ 교반 {str(actuators.get('mixing', 'unknown')).upper()} · EC {str(actuators.get('ec', 'unknown')).upper()} · pH {str(actuators.get('ph', 'unknown')).upper()}\n"
@@ -566,12 +584,24 @@ def telegram_message_authorized(message: dict[str, Any], config: dict[str, Any])
 def process_telegram_message(message: dict[str, Any]) -> None:
     """Handle read-only group commands; this path never controls hardware."""
     try:
-        if telegram_command_name(str(message.get("text") or "")) != "/status":
+        command = telegram_command_name(str(message.get("text") or ""))
+        if command not in {"/start", "/status", "/stop"}:
             return
         config = telegram_config()
         if not config["approvals_ready"] or not telegram_message_authorized(message, config):
             return
-        telegram_send_message(telegram_status_text())
+        if command == "/start":
+            telegram_send_message(
+                "🥦 브로콜리봇 연결 완료\n"
+                "카메라·센서 근거로 생육 단계를 분석하고, EC/pH가 단계별 범위를 벗어나면 "
+                "승인 버튼을 보내며, 승인 뒤에는 해당 단계의 목표값까지 주입·교반·재측정을 반복합니다.\n"
+                "반복 보정을 즉시 멈추려면 /stop 을 보내세요.\n\n"
+                "현재 상태는 /status 로 언제든 확인할 수 있습니다.\n\n" + telegram_status_text()
+            )
+        elif command == "/stop":
+            telegram_send_message("🛑 " + cancel_nutrient_feedback(f"telegram:{(message.get('from') or {}).get('id')}"))
+        else:
+            telegram_send_message(telegram_status_text())
     except (TypeError, ValueError, RuntimeError) as error:
         update_runtime(telegram_error=f"status command: {type(error).__name__}: {str(error)[:160]}")
 
@@ -929,14 +959,23 @@ def record_decision_event(item: dict[str, Any], recommendation_id: int, result: 
     })
 
 
-def nutrient_target_reached(actuator: str, latest: dict[str, Any]) -> bool:
+def growth_stage_profile(analysis: dict[str, Any] | None = None) -> tuple[str, dict[str, float]]:
+    """Use a validated AI stage, otherwise retain the safe school-configured stage."""
+    stage = str((analysis or {}).get("growth_stage") or DEFAULT_GROWTH_STAGE)
+    if stage not in GROWTH_STAGE_PROFILES:
+        stage = DEFAULT_GROWTH_STAGE
+    return stage, dict(GROWTH_STAGE_PROFILES[stage])
+
+
+def nutrient_target_reached(actuator: str, latest: dict[str, Any], profile: dict[str, Any] | None = None) -> bool:
     """A+B raises EC; the configured pH pump is acid only and lowers pH."""
+    profile = profile or growth_stage_profile()[1]
     if actuator == "ec":
         value = latest.get("ec")
-        return value is not None and float(value) >= 1.5
+        return value is not None and float(value) >= float(profile["ec_target"])
     if actuator == "ph":
         value = latest.get("ph")
-        return value is not None and 5.5 <= float(value) <= 6.5
+        return value is not None and float(profile["ph_low"]) <= float(value) <= float(profile["ph_target"])
     return False
 
 
@@ -949,6 +988,7 @@ def nutrient_feedback_policy(actuator: str) -> dict[str, Any]:
         "pulse_seconds": nutrient_pulse_seconds(actuator),
         "mix_seconds": NUTRIENT_MIX_SECONDS,
         "repeat_until_target": True,
+        "telegram_stop_command": "/stop",
     }
 
 
@@ -995,69 +1035,94 @@ def close_nutrient_session(item: dict[str, Any], status: str, operator: str, not
         store.decide_recommendation(recommendation_id, status, operator, note)
 
 
+def wait_for_nutrient_interval(seconds: int) -> str | None:
+    """Wait responsively for shutdown or an authorized Telegram /stop command."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if stop_event.is_set():
+            return "server"
+        if nutrient_session_cancel.wait(min(0.5, max(0.0, deadline - time.monotonic()))):
+            return "operator"
+    return None
+
+
+def cancel_nutrient_feedback(operator: str) -> str:
+    """Safe stop: cancel the loop and force only chemical/mixing outputs OFF."""
+    nutrient_session_cancel.set()
+    stopped = []
+    for actuator in ("ec", "ph", "mixing"):
+        command_id = secrets.token_hex(8)
+        try:
+            if CONTROL_ENABLED:
+                send_pico_command({
+                    "cmd_id": command_id, "action": "set", "actuator": actuator,
+                    "state": "off", "duration_seconds": 0,
+                })
+            store.add_event({
+                "command_id": command_id, "actuator": actuator, "requested_state": "off",
+                "duration_seconds": 0, "source": f"telegram_stop:{operator}",
+                "result": "sent" if CONTROL_ENABLED else "simulated",
+                "note": "Telegram /stop: 반복 양액 보정 즉시 중단",
+            })
+            stopped.append(actuator)
+        except (RuntimeError, serial.SerialException, OSError) as error:
+            store.add_event({
+                "command_id": command_id, "actuator": actuator, "requested_state": "off",
+                "duration_seconds": 0, "source": f"telegram_stop:{operator}",
+                "result": "failed", "note": str(error),
+            })
+    return "EC·pH·교반 OFF 명령 전송 · 진행 중 보정 취소" if stopped else "보정 취소 요청 기록"
+
+
 def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
-    """Repeat a human-approved PE350 correction until its target or a safety stop."""
+    """Repeat a human-approved correction to its stage target, with Telegram /stop."""
     actuator = str(item["actuator"])
     label = ACTUATORS[actuator]["label"]
     started_id = f"session:{secrets.token_hex(8)}"
     try:
+        nutrient_session_cancel.clear()
+        nutrient_session_state.update({"actuator": actuator, "operator": operator})
         store.add_event({
             "command_id": started_id, "actuator": actuator,
             "requested_state": "on", "duration_seconds": nutrient_pulse_seconds(actuator),
             "source": f"feedback_session:{operator}", "result": "session_started",
             "note": "승인된 폐루프 보정 시작 · 목표 범위까지 반복",
         })
+        profile = dict((item.get("evidence") or {}).get("growth_profile") or growth_stage_profile()[1])
+        stage = str((item.get("evidence") or {}).get("growth_stage") or growth_stage_profile()[0])
         pulse = 0
         while True:
             latest = latest_with_health()
             if not latest.get("pe350_connected"):
                 raise RuntimeError("PE350 데이터가 지연되어 보정을 중단함")
-            if actuator == "ec" and latest.get("ec") is not None and float(latest["ec"]) > 2.0:
+            if actuator == "ec" and latest.get("ec") is not None and float(latest["ec"]) > float(profile["ec_high"]):
                 note = f"EC 상한 초과 감지: {nutrient_value_text(actuator, latest)} · A+B 추가 주입 차단"
-                store.add_event({
-                    "command_id": started_id, "actuator": actuator,
-                    "requested_state": "off", "duration_seconds": 0,
-                    "source": f"feedback_session:{operator}", "result": "safety_stop", "note": note,
-                })
                 close_nutrient_session(item, "safety_stopped", operator, note)
                 telegram_session_notice(f"⚠️ {label} 보정 안전 중단\n{note}")
                 return
-            if actuator == "ph" and latest.get("ph") is not None and float(latest["ph"]) < 5.5:
+            if actuator == "ph" and latest.get("ph") is not None and float(latest["ph"]) < float(profile["ph_low"]):
                 note = f"pH 하한 아래 감지: {nutrient_value_text(actuator, latest)} · 산성액 추가 주입 차단"
-                store.add_event({
-                    "command_id": started_id, "actuator": actuator,
-                    "requested_state": "off", "duration_seconds": 0,
-                    "source": f"feedback_session:{operator}", "result": "safety_stop", "note": note,
-                })
                 close_nutrient_session(item, "safety_stopped", operator, note)
                 telegram_session_notice(f"⚠️ {label} 보정 안전 중단\n{note}")
                 return
-            if nutrient_target_reached(actuator, latest):
-                note = f"목표 범위 도달: {nutrient_value_text(actuator, latest)}"
-                store.add_event({
-                    "command_id": started_id, "actuator": actuator,
-                    "requested_state": "off", "duration_seconds": 0,
-                    "source": f"feedback_session:{operator}", "result": "target_reached", "note": note,
-                })
+            if nutrient_target_reached(actuator, latest, profile):
+                note = f"{stage} 목표값 도달: {nutrient_value_text(actuator, latest)}"
                 close_nutrient_session(item, "completed", operator, note)
-                telegram_session_notice(f"🥦 {label} 보정 완료\n{note}\n추가 주입 없이 종료했습니다.")
+                telegram_session_notice(f"🥦 {label} 보정 완료\n{note}\n중단하려면 /stop")
                 return
-
             pulse += 1
             before = nutrient_value_text(actuator, latest)
-            send_session_command(
-                actuator, "on", nutrient_pulse_seconds(actuator), operator,
-                f"보정 {pulse}회 · 주입 전 {before}",
-            )
-            if stop_event.wait(nutrient_pulse_seconds(actuator) + 1):
-                close_nutrient_session(item, "interrupted", operator, "서버 종료로 보정 세션 중단")
+            send_session_command(actuator, "on", nutrient_pulse_seconds(actuator), operator, f"{stage} {pulse}회 보정 · 주입 전 {before}")
+            interrupted = wait_for_nutrient_interval(nutrient_pulse_seconds(actuator) + 1)
+            if interrupted:
+                note = "Telegram /stop으로 보정 중단" if interrupted == "operator" else "서버 종료로 보정 세션 중단"
+                close_nutrient_session(item, "cancelled" if interrupted == "operator" else "interrupted", operator, note)
                 return
-            send_session_command(
-                "mixing", "on", NUTRIENT_MIX_SECONDS, operator,
-                f"{label} 보정 후 교반 {NUTRIENT_MIX_SECONDS}초 · {pulse}회",
-            )
-            if stop_event.wait(NUTRIENT_MIX_SECONDS + 5):
-                close_nutrient_session(item, "interrupted", operator, "서버 종료로 보정 세션 중단")
+            send_session_command("mixing", "on", NUTRIENT_MIX_SECONDS, operator, f"{label} 보정 후 교반 {NUTRIENT_MIX_SECONDS}초 · {pulse}회")
+            interrupted = wait_for_nutrient_interval(NUTRIENT_MIX_SECONDS + 5)
+            if interrupted:
+                note = "Telegram /stop으로 보정 중단" if interrupted == "operator" else "서버 종료로 보정 세션 중단"
+                close_nutrient_session(item, "cancelled" if interrupted == "operator" else "interrupted", operator, note)
                 return
 
     except Exception as error:
@@ -1071,6 +1136,7 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
         close_nutrient_session(item, "blocked", operator, note)
         telegram_session_notice(f"⚠️ {label} 보정 세션이 안전상 중단되었습니다.\n현장과 대시보드 기록을 확인해 주세요.")
     finally:
+        nutrient_session_state.update({"actuator": None, "operator": None})
         nutrient_session_lock.release()
 
 
@@ -1255,11 +1321,11 @@ def most_recent_capture() -> dict[str, Any] | None:
     return None
 
 
-def deterministic_analysis(latest: dict[str, Any], capture: dict[str, Any] | None) -> dict[str, Any]:
+def deterministic_analysis(latest: dict[str, Any], capture: dict[str, Any]) -> dict[str, Any]:
     warnings = []
     for label, key, low, high in (
         ("기온", "air_temp", 18.0, 25.0), ("습도", "humidity", 60.0, 80.0),
-        ("EC", "ec", 1.5, 2.0), ("pH", "ph", 5.5, 6.5),
+        ("EC", "ec", 1.0, 1.5), ("pH", "ph", 5.8, 6.2),
     ):
         value = latest.get(key)
         if value is None:
@@ -1278,6 +1344,9 @@ def deterministic_analysis(latest: dict[str, Any], capture: dict[str, Any] | Non
         "overall_status": overall,
         "summary": "; ".join(warnings) if warnings else "수집된 환경값이 현재 관리 기준 안에 있습니다.",
         "confidence": "중간" if latest else "낮음",
+        "growth_stage": DEFAULT_GROWTH_STAGE,
+        "growth_stage_confidence": "낮음",
+        "nutrition_assessment": "AI 이미지 분석을 사용할 수 없어 학교 기본 단계 기준으로 EC·pH를 비교했습니다.",
         "observations": observations,
         "limitations": limitations + ["OpenAI API를 사용하지 않은 규칙 기반 결과"],
     }
@@ -1292,9 +1361,13 @@ def openai_analysis(latest: dict[str, Any], capture: dict[str, Any] | None) -> d
         "text": (
             "브로콜리 스마트팜 일일 관찰을 수행하라. 센서값 출처와 누락을 구분하고, "
             "사진에서 직접 보이는 사실만 기록하라. 병해충을 확진하지 말고 제어 명령을 내리지 마라. "
+            "사진과 센서 근거로 생육 단계를 육묘기·활착기·생육기·수확전 중 하나로 분류하되, "
+            "확신이 낮으면 학교 기본값인 육묘기를 사용했다고 limitations에 밝혀라. "
             "반드시 JSON 하나만 반환하라: "
             '{"overall_status":"정상|주의|경고|판단 불가","summary":"...",'
-            '"confidence":"높음|중간|낮음","observations":["..."],"limitations":["..."]}. '
+            '"confidence":"높음|중간|낮음","growth_stage":"육묘기|활착기|생육기|수확전",'
+            '"growth_stage_confidence":"높음|중간|낮음","nutrition_assessment":"...",'
+            '"observations":["..."],"limitations":["..."]}. '
             "센서 데이터: " + json.dumps(latest, ensure_ascii=False, default=str)
         ),
     }]
@@ -1325,6 +1398,15 @@ def openai_analysis(latest: dict[str, Any], capture: dict[str, Any] | None) -> d
                             "type": "string",
                             "enum": ["높음", "중간", "낮음"],
                         },
+                        "growth_stage": {
+                            "type": "string",
+                            "enum": ["육묘기", "활착기", "생육기", "수확전"],
+                        },
+                        "growth_stage_confidence": {
+                            "type": "string",
+                            "enum": ["높음", "중간", "낮음"],
+                        },
+                        "nutrition_assessment": {"type": "string"},
                         "observations": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -1335,7 +1417,8 @@ def openai_analysis(latest: dict[str, Any], capture: dict[str, Any] | None) -> d
                         },
                     },
                     "required": [
-                        "overall_status", "summary", "confidence",
+                        "overall_status", "summary", "confidence", "growth_stage",
+                        "growth_stage_confidence", "nutrition_assessment",
                         "observations", "limitations",
                     ],
                     "additionalProperties": False,
@@ -1369,8 +1452,9 @@ def rule_alert_allowed(title: str) -> bool:
     return True
 
 
-def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
+def create_rule_recommendations(latest: dict[str, Any], analysis: dict[str, Any] | None = None) -> list[int]:
     candidates = []
+    stage, profile = growth_stage_profile(analysis)
     temp, humidity = latest.get("air_temp"), latest.get("humidity")
     if temp is not None and float(temp) > 25.0:
         candidates.append({
@@ -1388,33 +1472,39 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
         })
     ec, ph = latest.get("ec"), latest.get("ph")
     pe350_ready = bool(latest.get("pe350_connected", ec is not None and ph is not None))
-    if NUTRIENT_FEEDBACK_ENABLED and pe350_ready and ec is not None and float(ec) < 1.5:
+    if NUTRIENT_FEEDBACK_ENABLED and pe350_ready and ec is not None and float(ec) < profile["ec_low"]:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
-            "title": f"EC 낮음: A+B {EC_PULSE_SECONDS}초 보정 승인 요청",
+            "title": f"{stage} EC 낮음: A+B {EC_PULSE_SECONDS}초 보정 승인 요청",
             "rationale": (
-                f"EC {float(ec):.3f} dS/m가 하한 1.5 미만. 승인 시 A+B를 {EC_PULSE_SECONDS}초씩 "
-                f"주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350 재측정을 목표 범위까지 반복"
+                f"AI 판단 단계: {stage}. 현재 EC {float(ec):.3f} dS/m는 목표 {profile['ec_target']:.1f} "
+                f"(관리 {profile['ec_low']:.1f}~{profile['ec_high']:.1f})보다 낮음. 승인 시 A+B를 "
+                f"{EC_PULSE_SECONDS}초씩 주입하고 {NUTRIENT_MIX_SECONDS}초 교반·재측정을 목표값까지 반복. /stop으로 중단 가능"
             ),
             "actuator": "ec", "requested_state": "on", "duration_seconds": EC_PULSE_SECONDS,
             "evidence": {
-                "ec": ec, "lower_limit": 1.5, "target": "1.5~2.0", "pump": "A+B",
+                "ec": ec, "lower_limit": profile["ec_low"], "target": f"{profile['ec_low']:.1f}~{profile['ec_high']:.1f}", "pump": "A+B",
+                "growth_stage": stage, "growth_profile": profile,
+                "analysis_confidence": (analysis or {}).get("growth_stage_confidence", "낮음"),
                 "feedback_policy": nutrient_feedback_policy("ec"),
-            }, "model": None,
+            }, "model": (analysis or {}).get("model"),
         })
-    if NUTRIENT_FEEDBACK_ENABLED and pe350_ready and ph is not None and float(ph) > 6.5:
+    if NUTRIENT_FEEDBACK_ENABLED and pe350_ready and ph is not None and float(ph) > profile["ph_high"]:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
-            "title": f"pH 높음: 산성액 {PH_PULSE_SECONDS}초 보정 승인 요청",
+            "title": f"{stage} pH 높음: 산성액 {PH_PULSE_SECONDS}초 보정 승인 요청",
             "rationale": (
-                f"pH {float(ph):.2f}가 상한 6.5 초과. 승인 시 산성 pH 조절액을 {PH_PULSE_SECONDS}초씩 "
-                f"주입하고, 매회 {NUTRIENT_MIX_SECONDS}초 교반 후 PE350 재측정을 목표 범위까지 반복"
+                f"AI 판단 단계: {stage}. 현재 pH {float(ph):.2f}는 목표 {profile['ph_target']:.1f} "
+                f"(관리 {profile['ph_low']:.1f}~{profile['ph_high']:.1f})보다 높음. 승인 시 산성 pH 조절액을 "
+                f"{PH_PULSE_SECONDS}초씩 주입하고 {NUTRIENT_MIX_SECONDS}초 교반·재측정을 목표값까지 반복. /stop으로 중단 가능"
             ),
             "actuator": "ph", "requested_state": "on", "duration_seconds": PH_PULSE_SECONDS,
             "evidence": {
-                "ph": ph, "upper_limit": 6.5, "target": "5.5~6.5", "pump": "acid",
+                "ph": ph, "upper_limit": profile["ph_high"], "target": f"{profile['ph_low']:.1f}~{profile['ph_high']:.1f}", "pump": "acid",
+                "growth_stage": stage, "growth_profile": profile,
+                "analysis_confidence": (analysis or {}).get("growth_stage_confidence", "낮음"),
                 "feedback_policy": nutrient_feedback_policy("ph"),
-            }, "model": None,
+            }, "model": (analysis or {}).get("model"),
         })
     for pending in store.recommendations(200):
         if pending.get("status") != "pending" or pending.get("source") != "nutrient_feedback_rule":
@@ -1461,7 +1551,7 @@ def run_analysis() -> dict[str, Any]:
             result = deterministic_analysis(latest, capture)
             result["limitations"] = list(result.get("limitations", [])) + [degraded_error]
         analysis_id = store.add_analysis(result)
-        recommendation_ids = create_rule_recommendations(latest)
+        recommendation_ids = create_rule_recommendations(latest, result)
         store.workflow("ai_analysis", "degraded" if degraded_error else "success", f"analysis={analysis_id}; {degraded_error or 'OpenAI success'}")
         return {"id": analysis_id, "recommendation_ids": recommendation_ids, **result}
     except Exception as error:
@@ -1522,6 +1612,8 @@ def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], cap
     field_check = public_notes[0] if public_notes else "잎·배지·양액 상태를 현장에서 함께 확인해 주세요."
     model = str(analysis.get("model") or "")
     analysis_mode = "기본 안전 분석" if model == "rule-engine:no-ai" else "AI 사진·환경 분석"
+    stage, profile = growth_stage_profile(analysis)
+    nutrition = telegram_public_text(analysis.get("nutrition_assessment"), "센서값과 단계별 EC·pH 목표를 함께 확인합니다.")
 
     return (
         "🥦 브로콜리 | 오늘의 상태\n"
@@ -1532,6 +1624,9 @@ def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], cap
         f"   {latest.get('air_temp', '--')}°C · 습도 {latest.get('humidity', '--')}%\n"
         f"🧪 양액 ({source})\n"
         f"   EC {latest.get('ec', '--')} dS/m · pH {latest.get('ph', '--')}\n"
+        f"🌱 생육 단계: {stage} (판단 {analysis.get('growth_stage_confidence', '낮음')})\n"
+        f"   목표 EC {profile['ec_target']:.1f} · pH {profile['ph_target']:.1f}\n"
+        f"   영양 판단: {nutrition}\n"
         f"📷 최신 사진: {'첨부됨' if capture_available else '없음'}\n"
         f"🤖 분석 방식: {analysis_mode}\n"
         f"🔎 현장 확인: {field_check}\n\n"
@@ -1563,9 +1658,29 @@ def telegram_send_approval_requests(recommendation_ids: list[int], *, context: s
     if not keyboard:
         return "not_ready_or_no_pending_request"
     try:
+        details = []
+        for recommendation_id in recommendation_ids:
+            item = store.recommendation(recommendation_id)
+            if not item or item.get("status") != "pending":
+                continue
+            evidence = item.get("evidence") or {}
+            if item.get("source") == "nutrient_feedback_rule":
+                stage = evidence.get("growth_stage", DEFAULT_GROWTH_STAGE)
+                target = evidence.get("target", "관리 기준")
+                value = evidence.get("ec") if item.get("actuator") == "ec" else evidence.get("ph")
+                label = "EC" if item.get("actuator") == "ec" else "pH"
+                unit = " dS/m" if label == "EC" else ""
+                details.append(
+                    f"🌱 AI 판단: {stage} (신뢰도 {evidence.get('analysis_confidence', '낮음')})\n"
+                    f"🧪 현재 {label} {value}{unit} · 적정 범위 {target}\n"
+                    f"💡 {item.get('rationale')}"
+                )
+            else:
+                details.append(f"💡 {item.get('rationale') or item.get('title')}")
         telegram_send_message(
             f"🥦 새 제어 제안 ({context})\n"
-            "AI 관찰과 고정 안전 규칙을 근거로 생성됐습니다. 승인 뒤에도 서버와 Pico의 안전검사를 통과해야 실행됩니다.",
+            + "\n\n".join(details)
+            + "\n\n승인하면 해당 생육 단계의 목표값까지 반복 보정합니다. 언제든 /stop 으로 즉시 중단할 수 있습니다.",
             keyboard,
         )
         store.workflow("telegram_approval_request", "success", f"context={context}; ids={recommendation_ids}")
@@ -1735,7 +1850,9 @@ def sensor_alert_job() -> None:
     latest = latest_with_health()
     if not latest.get("pico_connected"):
         return
-    recommendation_ids = create_rule_recommendations(latest)
+    previous_row = (store.analyses(1) or [{}])[0]
+    previous = dict(previous_row.get("result") or {})
+    recommendation_ids = create_rule_recommendations(latest, previous)
     if recommendation_ids:
         telegram_send_approval_requests(recommendation_ids, context="실시간 센서 경보")
 
