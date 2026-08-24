@@ -1712,11 +1712,12 @@ def telegram_daily_brief_job(force: bool = False) -> dict[str, Any]:
             telegram_send_photo(capture_path, caption, keyboard)
         else:
             telegram_send_message(caption, keyboard)
+        report = create_report(send_telegram=True)
         store.workflow(
             "telegram_on_demand_brief" if force else "telegram_daily_brief", "success",
-            f"captures={sum(row['status'] == 'success' for row in captures)}; analysis={analysis['id']}",
+            f"captures={sum(row['status'] == 'success' for row in captures)}; analysis={analysis['id']}; report={report['id']}",
         )
-        return {"status": "sent", "analysis": analysis, "captures": captures}
+        return {"status": "sent", "analysis": analysis, "captures": captures, "report": report}
     except Exception as error:
         store.workflow("telegram_daily_brief", "failed", f"{type(error).__name__}: {str(error)[:300]}")
         raise
@@ -1894,7 +1895,6 @@ async def lifespan(_app: FastAPI):
     )
     if AUTOMATION_ENABLED:
         scheduler.add_job(capture_and_analyze_job, "cron", hour="0,6,18", minute=0, id="capture_analysis", max_instances=1)
-        scheduler.add_job(daily_report_job, "cron", hour=20, minute=0, id="daily_report", max_instances=1)
     scheduler.add_job(
         telegram_daily_brief_job,
         "cron",
