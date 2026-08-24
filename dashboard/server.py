@@ -521,6 +521,61 @@ def telegram_send_photo(path: Path, caption: str, reply_markup: dict[str, Any] |
         return telegram_api("sendPhoto", data=data, files={"photo": photo})
 
 
+def telegram_command_name(text: str) -> str:
+    """Normalize Telegram commands with or without the @bot suffix."""
+    first = (text or "").strip().split(maxsplit=1)[0].lower()
+    return first.split("@", 1)[0]
+
+
+def telegram_status_text() -> str:
+    """A concise, measured status response for an authorized Telegram command."""
+    latest = latest_with_health()
+    with state_lock:
+        actuators = dict(runtime_state["actuators"])
+    pending = [item for item in store.recommendations(50) if item.get("status") == "pending"]
+    pending_labels = [
+        f"#{item['id']} {ACTUATORS.get(str(item.get('actuator')), {}).get('label', item.get('actuator') or '현장 확인')}"
+        for item in pending[:4]
+    ]
+    sensor_note = "정상" if latest.get("pe350_connected") else "PE350 데이터 확인 필요"
+    if latest.get("sensor_errors"):
+        sensor_note += " · 일부 센서 오류"
+    return (
+        "🥦 브로콜리 현재 상태\n"
+        f"🕛 {datetime.now(SEOUL).strftime('%Y-%m-%d %H:%M')} KST\n\n"
+        f"🧪 EC {latest.get('ec', '--')} dS/m · pH {latest.get('ph', '--')} · 양액 {latest.get('solution_temp', '--')}°C\n"
+        f"🌡 공기 {latest.get('air_temp', '--')}°C · 습도 {latest.get('humidity', '--')}%\n"
+        f"🔄 공급 펌프: {str(actuators.get('supply', 'unknown')).upper()} (24시간 순환)\n"
+        f"⚙️ 교반 {str(actuators.get('mixing', 'unknown')).upper()} · EC {str(actuators.get('ec', 'unknown')).upper()} · pH {str(actuators.get('ph', 'unknown')).upper()}\n"
+        f"📡 센서: {sensor_note}\n"
+        f"📋 승인 대기: {', '.join(pending_labels) if pending_labels else '없음'}\n\n"
+        "pH/EC 제안은 버튼으로 승인해야만 실행됩니다."
+    )
+
+
+def telegram_message_authorized(message: dict[str, Any], config: dict[str, Any]) -> bool:
+    chat_id = str((message.get("chat") or {}).get("id", ""))
+    user_id = int((message.get("from") or {}).get("id"))
+    if chat_id != config["chat_id"]:
+        return False
+    return user_id in config["approvers"] or (
+        config["allow_group_members"] and telegram_group_member_allowed(chat_id, user_id)
+    )
+
+
+def process_telegram_message(message: dict[str, Any]) -> None:
+    """Handle read-only group commands; this path never controls hardware."""
+    try:
+        if telegram_command_name(str(message.get("text") or "")) != "/status":
+            return
+        config = telegram_config()
+        if not config["approvals_ready"] or not telegram_message_authorized(message, config):
+            return
+        telegram_send_message(telegram_status_text())
+    except (TypeError, ValueError, RuntimeError) as error:
+        update_runtime(telegram_error=f"status command: {type(error).__name__}: {str(error)[:160]}")
+
+
 def time_minutes(value: str) -> int:
     hour, minute = (int(part) for part in value.split(":"))
     return hour * 60 + minute
@@ -955,8 +1010,8 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
         pulse = 0
         while True:
             latest = latest_with_health()
-            if not latest["sensor_control_ready"]:
-                raise RuntimeError("PE350 또는 환경 센서 데이터가 지연되어 보정을 중단함")
+            if not latest.get("pe350_connected"):
+                raise RuntimeError("PE350 데이터가 지연되어 보정을 중단함")
             if actuator == "ec" and latest.get("ec") is not None and float(latest["ec"]) > 2.0:
                 note = f"EC 상한 초과 감지: {nutrient_value_text(actuator, latest)} · A+B 추가 주입 차단"
                 store.add_event({
@@ -1332,7 +1387,8 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
             "evidence": {"humidity": humidity, "threshold": 80.0}, "model": None,
         })
     ec, ph = latest.get("ec"), latest.get("ph")
-    if NUTRIENT_FEEDBACK_ENABLED and ec is not None and float(ec) < 1.5:
+    pe350_ready = bool(latest.get("pe350_connected", ec is not None and ph is not None))
+    if NUTRIENT_FEEDBACK_ENABLED and pe350_ready and ec is not None and float(ec) < 1.5:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
             "title": f"EC 낮음: A+B {EC_PULSE_SECONDS}초 보정 승인 요청",
@@ -1346,7 +1402,7 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
                 "feedback_policy": nutrient_feedback_policy("ec"),
             }, "model": None,
         })
-    if NUTRIENT_FEEDBACK_ENABLED and ph is not None and float(ph) > 6.5:
+    if NUTRIENT_FEEDBACK_ENABLED and pe350_ready and ph is not None and float(ph) > 6.5:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
             "title": f"pH 높음: 산성액 {PH_PULSE_SECONDS}초 보정 승인 요청",
@@ -1362,6 +1418,11 @@ def create_rule_recommendations(latest: dict[str, Any]) -> list[int]:
         })
     for pending in store.recommendations(200):
         if pending.get("status") != "pending" or pending.get("source") != "nutrient_feedback_rule":
+            continue
+        if not recommendation_is_fresh(pending):
+            note = "승인 유효시간이 지나 새 실측값 기반 요청으로 교체"
+            store.decide_recommendation(int(pending["id"]), "superseded", "system", note)
+            record_decision_event(pending, int(pending["id"]), "superseded", "system", note)
             continue
         if nutrient_request_matches_policy(pending):
             continue
@@ -1606,7 +1667,7 @@ def telegram_poll_worker() -> None:
         try:
             saved_offset = store.setting("telegram_update_offset")
             offset = int(saved_offset) if saved_offset and saved_offset.isdigit() else None
-            data: dict[str, Any] = {"timeout": 20, "allowed_updates": json.dumps(["callback_query"])}
+            data: dict[str, Any] = {"timeout": 20, "allowed_updates": json.dumps(["callback_query", "message"])}
             if offset is not None:
                 data["offset"] = offset
             elif bootstrap:
@@ -1626,6 +1687,9 @@ def telegram_poll_worker() -> None:
                 callback = update.get("callback_query")
                 if isinstance(callback, dict):
                     process_telegram_callback(callback)
+                message = update.get("message")
+                if isinstance(message, dict):
+                    process_telegram_message(message)
         except Exception as error:
             update_runtime(telegram_polling=False, telegram_error=f"Telegram polling: {type(error).__name__}: {str(error)[:180]}")
             stop_event.wait(10)
@@ -1669,7 +1733,7 @@ def sensor_alert_job() -> None:
     if not SENSOR_ALERTS_ENABLED:
         return
     latest = latest_with_health()
-    if not latest.get("sensor_control_ready"):
+    if not latest.get("pico_connected"):
         return
     recommendation_ids = create_rule_recommendations(latest)
     if recommendation_ids:

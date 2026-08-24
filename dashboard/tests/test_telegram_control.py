@@ -11,6 +11,7 @@ from dashboard.server import (
     parse_telegram_callback,
     telegram_approver_ids,
     telegram_callback_data,
+    telegram_command_name,
     telegram_daily_caption,
 )
 
@@ -23,6 +24,7 @@ def assert_equal(actual, expected, label):
 def main():
     assert_equal(telegram_callback_data(42, "approve"), "farm:a:42", "approve button")
     assert_equal(parse_telegram_callback("farm:r:42"), ("reject", 42), "reject parser")
+    assert_equal(telegram_command_name("/status@brococolibot 지금 상태"), "/status", "status command")
     assert_equal(telegram_approver_ids("12345, 67890"), {12345, 67890}, "approver IDs")
     assert_equal(telegram_approver_ids("12345\n67890"), {12345, 67890}, "approver IDs on separate lines")
     try:
