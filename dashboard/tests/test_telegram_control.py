@@ -27,6 +27,7 @@ def main():
     assert_equal(telegram_command_name("/status@brococolibot 지금 상태"), "/status", "status command")
     assert_equal(telegram_command_name("/start@brococolibot"), "/start", "start command")
     assert_equal(telegram_command_name("/report@brococolibot"), "/report", "report command")
+    assert_equal(telegram_command_name("/help@brococolibot"), "/help", "help command")
     assert_equal(telegram_command_name("/stop@brococolibot"), "/stop", "stop command")
     assert_equal(telegram_approver_ids("12345, 67890"), {12345, 67890}, "approver IDs")
     assert_equal(telegram_approver_ids("12345\n67890"), {12345, 67890}, "approver IDs on separate lines")

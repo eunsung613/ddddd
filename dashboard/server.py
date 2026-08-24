@@ -585,12 +585,22 @@ def process_telegram_message(message: dict[str, Any]) -> None:
     """Handle read-only group commands; this path never controls hardware."""
     try:
         command = telegram_command_name(str(message.get("text") or ""))
-        if command not in {"/start", "/status", "/report", "/stop"}:
+        if command not in {"/start", "/status", "/report", "/stop", "/help", "/commands"}:
             return
         config = telegram_config()
         if not config["approvals_ready"] or not telegram_message_authorized(message, config):
             return
-        if command == "/start":
+        if command in {"/help", "/commands"}:
+            telegram_send_message(
+                "🥦 브로콜리봇 명령어\n\n"
+                "/start · 봇 연결 및 현재 상태\n"
+                "/status · 현재 센서·펌프·승인 대기 상태\n"
+                "/report · 최신 촬영, AI 분석, 사진 브리핑, PDF 보고서 생성\n"
+                "/stop · 진행 중 EC/pH 반복 보정과 교반 즉시 중지\n"
+                "/help 또는 /commands · 이 명령어 목록\n\n"
+                "EC/pH 펌프는 Telegram 승인 버튼을 누른 경우에만 동작합니다."
+            )
+        elif command == "/start":
             telegram_send_message(
                 "🥦 브로콜리봇 연결 완료\n"
                 "현재 상태는 아래와 같습니다.\n\n" + telegram_status_text()
