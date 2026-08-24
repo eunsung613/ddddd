@@ -585,16 +585,18 @@ def process_telegram_message(message: dict[str, Any]) -> None:
     """Handle read-only group commands; this path never controls hardware."""
     try:
         command = telegram_command_name(str(message.get("text") or ""))
-        if command not in {"/start", "/status", "/stop"}:
+        if command not in {"/start", "/status", "/report", "/stop"}:
             return
         config = telegram_config()
         if not config["approvals_ready"] or not telegram_message_authorized(message, config):
             return
         if command == "/start":
             telegram_send_message(
-                "🥦 지금 브리핑을 준비합니다. 최신 사진 촬영과 AI 생육 분석 후 결과를 이 채팅에 보냅니다.\n"
-                "반복 양액 보정은 /stop 으로 언제든 즉시 중단할 수 있습니다."
+                "🥦 브로콜리봇 연결 완료\n"
+                "현재 상태는 아래와 같습니다.\n\n" + telegram_status_text()
             )
+        elif command == "/report":
+            telegram_send_message("📄 최신 사진·AI 분석·PDF 보고서를 준비합니다. 완료되면 이 채팅에 보냅니다.")
             threading.Thread(
                 target=telegram_daily_brief_job,
                 kwargs={"force": True}, daemon=True, name="telegram-start-brief",
