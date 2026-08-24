@@ -2046,7 +2046,7 @@ def sensor_history(
     end: str | None = None,
     max_points: int = Query(1600, ge=200, le=2500),
 ) -> list[dict[str, Any]]:
-    """Read a preset or explicit Seoul-time range without returning an unbounded series."""
+    """Read a preset or explicit Seoul-time range as one-hour sensor averages."""
     if bool(start) != bool(end):
         raise HTTPException(400, "Provide both start and end timestamps")
     if start and end:
