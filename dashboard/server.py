@@ -592,12 +592,13 @@ def process_telegram_message(message: dict[str, Any]) -> None:
             return
         if command == "/start":
             telegram_send_message(
-                "🥦 브로콜리봇 연결 완료\n"
-                "카메라·센서 근거로 생육 단계를 분석하고, EC/pH가 단계별 범위를 벗어나면 "
-                "승인 버튼을 보내며, 승인 뒤에는 해당 단계의 목표값까지 주입·교반·재측정을 반복합니다.\n"
-                "반복 보정을 즉시 멈추려면 /stop 을 보내세요.\n\n"
-                "현재 상태는 /status 로 언제든 확인할 수 있습니다.\n\n" + telegram_status_text()
+                "🥦 지금 브리핑을 준비합니다. 최신 사진 촬영과 AI 생육 분석 후 결과를 이 채팅에 보냅니다.\n"
+                "반복 양액 보정은 /stop 으로 언제든 즉시 중단할 수 있습니다."
             )
+            threading.Thread(
+                target=telegram_daily_brief_job,
+                kwargs={"force": True}, daemon=True, name="telegram-start-brief",
+            ).start()
         elif command == "/stop":
             telegram_send_message("🛑 " + cancel_nutrient_feedback(f"telegram:{(message.get('from') or {}).get('id')}"))
         else:
@@ -1691,10 +1692,10 @@ def telegram_send_approval_requests(recommendation_ids: list[int], *, context: s
         return "failed"
 
 
-def telegram_daily_brief_job() -> dict[str, Any]:
+def telegram_daily_brief_job(force: bool = False) -> dict[str, Any]:
     """Capture, observe, and send a noon status. It never executes a command itself."""
     config = telegram_config()
-    if not config["daily_enabled"]:
+    if not force and not config["daily_enabled"]:
         return {"status": "disabled"}
     if not config["configured"]:
         store.workflow("telegram_daily_brief", "skipped", "Telegram token or chat ID is not configured")
@@ -1712,7 +1713,7 @@ def telegram_daily_brief_job() -> dict[str, Any]:
         else:
             telegram_send_message(caption, keyboard)
         store.workflow(
-            "telegram_daily_brief", "success",
+            "telegram_on_demand_brief" if force else "telegram_daily_brief", "success",
             f"captures={sum(row['status'] == 'success' for row in captures)}; analysis={analysis['id']}",
         )
         return {"status": "sent", "analysis": analysis, "captures": captures}
