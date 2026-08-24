@@ -1334,7 +1334,18 @@ def most_recent_capture() -> dict[str, Any] | None:
     return None
 
 
-def deterministic_analysis(latest: dict[str, Any], capture: dict[str, Any]) -> dict[str, Any]:
+def latest_capture_set() -> list[dict[str, Any]]:
+    """Return the newest successful image for every configured camera view."""
+    selected: dict[str, dict[str, Any]] = {}
+    for item in store.captures(100):
+        camera_id = str(item.get("camera_id") or "")
+        path = Path(str(item.get("path") or ""))
+        if camera_id and camera_id not in selected and item.get("status") == "success" and path.exists():
+            selected[camera_id] = item
+    return [selected[key] for key in sorted(selected)]
+
+
+def deterministic_analysis(latest: dict[str, Any], captures: list[dict[str, Any]]) -> dict[str, Any]:
     warnings = []
     for label, key, low, high in (
         ("기온", "air_temp", 18.0, 25.0), ("습도", "humidity", 60.0, 80.0),
@@ -1348,12 +1359,13 @@ def deterministic_analysis(latest: dict[str, Any], capture: dict[str, Any]) -> d
     overall = "주의" if warnings else ("정상" if latest else "판단 불가")
     observations = []
     limitations = []
-    if capture:
-        observations.append("카메라 이미지는 저장되었으나 규칙 분석에서는 식물 외형을 판독하지 않음")
+    if captures:
+        observations.append(f"카메라 {len(captures)}대의 최신 이미지는 저장되었으나 규칙 분석에서는 식물 외형을 판독하지 않음")
     else:
         limitations.append("사용 가능한 카메라 이미지 없음")
     return {
-        "model": "rule-engine:no-ai", "capture_id": capture["id"] if capture else None,
+        "model": "rule-engine:no-ai", "capture_id": captures[0]["id"] if captures else None,
+        "capture_ids": [item["id"] for item in captures],
         "overall_status": overall,
         "summary": "; ".join(warnings) if warnings else "수집된 환경값이 현재 관리 기준 안에 있습니다.",
         "confidence": "중간" if latest else "낮음",
@@ -1365,15 +1377,16 @@ def deterministic_analysis(latest: dict[str, Any], capture: dict[str, Any]) -> d
     }
 
 
-def openai_analysis(latest: dict[str, Any], capture: dict[str, Any] | None) -> dict[str, Any]:
+def openai_analysis(latest: dict[str, Any], captures: list[dict[str, Any]]) -> dict[str, Any]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return deterministic_analysis(latest, capture)
+        return deterministic_analysis(latest, captures)
     content: list[dict[str, Any]] = [{
         "type": "input_text",
         "text": (
             "브로콜리 스마트팜 일일 관찰을 수행하라. 센서값 출처와 누락을 구분하고, "
             "사진에서 직접 보이는 사실만 기록하라. 병해충을 확진하지 말고 제어 명령을 내리지 마라. "
+            "서로 다른 카메라 3대의 사진을 하나의 농장 상태로 종합하되, 카메라별로 보이는 차이는 구분해 기록하라. "
             "사진과 센서 근거로 생육 단계를 육묘기·활착기·생육기·수확전 중 하나로 분류하되, "
             "확신이 낮으면 학교 기본값인 육묘기를 사용했다고 limitations에 밝혀라. "
             "반드시 JSON 하나만 반환하라: "
@@ -1384,8 +1397,13 @@ def openai_analysis(latest: dict[str, Any], capture: dict[str, Any] | None) -> d
             "센서 데이터: " + json.dumps(latest, ensure_ascii=False, default=str)
         ),
     }]
-    if capture and capture.get("path"):
-        image_bytes = Path(capture["path"]).read_bytes()
+    for capture in captures[:4]:
+        path = Path(str(capture.get("path") or ""))
+        if not path.exists():
+            continue
+        image_bytes = path.read_bytes()
+        camera_id = str(capture.get("camera_id") or "카메라")
+        content.append({"type": "input_text", "text": f"다음 이미지는 {camera_id} 시야다."})
         content.append({
             "type": "input_image",
             "image_url": "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii"),
@@ -1445,7 +1463,8 @@ def openai_analysis(latest: dict[str, Any], capture: dict[str, Any] | None) -> d
     result = json.loads(raw)
     result.update({
         "model": getattr(response, "model", OPENAI_MODEL),
-        "capture_id": capture["id"] if capture else None,
+        "capture_id": captures[0]["id"] if captures else None,
+        "capture_ids": [item["id"] for item in captures],
     })
     return result
 
@@ -1552,16 +1571,16 @@ def create_rule_recommendations(latest: dict[str, Any], analysis: dict[str, Any]
 
 def run_analysis() -> dict[str, Any]:
     latest = store.latest_sensor() or {}
-    capture = most_recent_capture()
+    captures = latest_capture_set()
     try:
         degraded_error = None
         try:
-            result = openai_analysis(latest, capture)
+            result = openai_analysis(latest, captures)
         except Exception as error:
             # Keep the scheduled safety/status notification alive, but never label a
             # deterministic fallback as an AI observation.
             degraded_error = f"OpenAI unavailable: {type(error).__name__}: {str(error)[:180]}"
-            result = deterministic_analysis(latest, capture)
+            result = deterministic_analysis(latest, captures)
             result["limitations"] = list(result.get("limitations", [])) + [degraded_error]
         analysis_id = store.add_analysis(result)
         recommendation_ids = create_rule_recommendations(latest, result)
@@ -1830,13 +1849,12 @@ def create_report(report_date: str | None = None, send_telegram: bool = False) -
     data_source = store.day_source_label(report_date)
     analyses = store.analyses(1)
     analysis = analyses[0] if analyses else None
-    capture = most_recent_capture()
-    capture_path = Path(capture["path"]) if capture and capture.get("path") else None
+    captures = latest_capture_set()
     model = analysis["model"] if analysis else "분석 기록 없음"
     actuator_events = store.day_events(report_date)
     output = REPORT_DIR / f"broccoli_daily_{report_date}.pdf"
     generate_daily_pdf(
-        output, report_date, stats, analysis, capture_path, model, data_source, BASE_DIR,
+        output, report_date, stats, analysis, captures, model, data_source, BASE_DIR,
         actuator_events=actuator_events,
     )
     telegram_status = telegram_send_report(output, f"{report_date} 브로콜리 AI 일일 생육관찰 보고서") if send_telegram else "not_requested"
