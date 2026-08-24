@@ -1116,8 +1116,8 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
         if not nutrient_request_matches_policy(item):
             raise HTTPException(409, "Dosing policy changed; request a fresh Telegram approval")
         latest = latest_with_health()
-        if not latest["sensor_control_ready"]:
-            raise HTTPException(409, "Required sensor evidence is incomplete or stale")
+        if not latest.get("pe350_connected"):
+            raise HTTPException(409, "PE350 evidence is incomplete or stale")
         return start_nutrient_feedback_session(item, operator)
     latest = latest_with_health()
     if not latest["sensor_control_ready"]:
