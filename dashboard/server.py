@@ -76,10 +76,10 @@ DEFAULT_GROWTH_STAGE = os.getenv("SMARTFARM_DEFAULT_GROWTH_STAGE", "육묘기").
 # Profiles are conservative nutrient-solution operating bands.  An AI image
 # observation can select a profile, but it never sends a relay command itself.
 GROWTH_STAGE_PROFILES = {
-    "육묘기": {"ec_low": 1.0, "ec_target": 1.3, "ec_high": 1.5, "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.2},
-    "활착기": {"ec_low": 1.3, "ec_target": 1.5, "ec_high": 1.8, "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.3},
-    "생육기": {"ec_low": 1.8, "ec_target": 2.2, "ec_high": 2.6, "ph_low": 5.9, "ph_target": 6.1, "ph_high": 6.4},
-    "수확전": {"ec_low": 2.5, "ec_target": 3.0, "ec_high": 3.5, "ph_low": 6.0, "ph_target": 6.2, "ph_high": 6.6},
+    "육묘기": {"ec_low": 1.0, "ec_target": 1.3, "ec_high": 1.5, "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.2, "temp_low": 15.0, "temp_target": 19.0, "temp_high": 22.0, "humidity_low": 60.0, "humidity_target": 68.0, "humidity_high": 75.0},
+    "활착기": {"ec_low": 1.3, "ec_target": 1.5, "ec_high": 1.8, "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.3, "temp_low": 16.0, "temp_target": 20.0, "temp_high": 24.0, "humidity_low": 60.0, "humidity_target": 68.0, "humidity_high": 75.0},
+    "생육기": {"ec_low": 1.8, "ec_target": 2.2, "ec_high": 2.6, "ph_low": 5.9, "ph_target": 6.1, "ph_high": 6.4, "temp_low": 16.0, "temp_target": 20.0, "temp_high": 24.0, "humidity_low": 55.0, "humidity_target": 65.0, "humidity_high": 72.0},
+    "수확전": {"ec_low": 2.5, "ec_target": 3.0, "ec_high": 3.5, "ph_low": 6.0, "ph_target": 6.2, "ph_high": 6.6, "temp_low": 14.0, "temp_target": 18.0, "temp_high": 22.0, "humidity_low": 55.0, "humidity_target": 62.0, "humidity_high": 70.0},
 }
 if DEFAULT_GROWTH_STAGE not in GROWTH_STAGE_PROFILES:
     DEFAULT_GROWTH_STAGE = "육묘기"
@@ -1849,13 +1849,15 @@ def create_report(report_date: str | None = None, send_telegram: bool = False) -
     data_source = store.day_source_label(report_date)
     analyses = store.analyses(1)
     analysis = analyses[0] if analyses else None
+    analysis_result = dict((analysis or {}).get("result") or {})
+    growth_stage, management_profile = growth_stage_profile(analysis_result)
     captures = latest_capture_set()
     model = analysis["model"] if analysis else "분석 기록 없음"
     actuator_events = store.day_events(report_date)
     output = REPORT_DIR / f"broccoli_daily_{report_date}.pdf"
     generate_daily_pdf(
         output, report_date, stats, analysis, captures, model, data_source, BASE_DIR,
-        actuator_events=actuator_events,
+        actuator_events=actuator_events, growth_stage=growth_stage, management_profile=management_profile,
     )
     telegram_status = telegram_send_report(output, f"{report_date} 브로콜리 AI 일일 생육관찰 보고서") if send_telegram else "not_requested"
     report_id = store.add_report({

@@ -71,6 +71,8 @@ def generate_daily_pdf(
     data_source: str,
     base_dir: Path,
     actuator_events: list[dict[str, Any]] | None = None,
+    growth_stage: str = "육묘기",
+    management_profile: dict[str, float] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     font = register_korean_font(base_dir)
@@ -124,8 +126,14 @@ def generate_daily_pdf(
         confidence = analysis.get("result", analysis).get("confidence", "낮음")
     else:
         overall, summary, confidence = "판단 불가", "당일 AI 분석 기록이 없습니다.", "낮음"
+    profile = management_profile or {
+        "ec_low": 1.0, "ec_target": 1.3, "ec_high": 1.5,
+        "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.2,
+        "temp_low": 15.0, "temp_target": 19.0, "temp_high": 22.0,
+        "humidity_low": 60.0, "humidity_target": 68.0, "humidity_high": 75.0,
+    }
     story.append(Table(
-        [["종합 상태", overall], ["분석 요약", Paragraph(summary, normal)], ["확신도", confidence]],
+        [["종합 상태", overall], ["생육 단계", growth_stage], ["분석 요약", Paragraph(summary, normal)], ["확신도", confidence]],
         colWidths=[30 * mm, 146 * mm],
         style=TableStyle([
             ("FONTNAME", (0, 0), (-1, -1), font),
@@ -139,19 +147,19 @@ def generate_daily_pdf(
     ))
 
     story.append(Paragraph("2. 환경 데이터 자동 판정", section))
-    sensor_rows = [["항목", f"일평균 (최소~최대) · {data_source}", "관리 기준", "판정"]]
+    sensor_rows = [["항목", f"일평균 (최소~최대) · {data_source}", f"{growth_stage} 관리 기준", "판정"]]
     definitions = (
-        ("EC", "ec", 2, "dS/m", 1.5, 2.0),
-        ("pH", "ph", 2, "pH", 5.5, 6.5),
-        ("기온", "air_temp", 1, "℃", 18.0, 25.0),
-        ("습도", "humidity", 1, "%", 60.0, 80.0),
-        ("CO₂", "co2", 0, "ppm", 350.0, 1500.0),
+        ("EC", "ec", 2, "dS/m", profile["ec_low"], profile["ec_target"], profile["ec_high"]),
+        ("pH", "ph", 2, "pH", profile["ph_low"], profile["ph_target"], profile["ph_high"]),
+        ("기온", "air_temp", 1, "℃", profile["temp_low"], profile["temp_target"], profile["temp_high"]),
+        ("습도", "humidity", 1, "%", profile["humidity_low"], profile["humidity_target"], profile["humidity_high"]),
+        ("CO₂", "co2", 0, "ppm", 350.0, 800.0, 1500.0),
     )
-    for label, key, digits, unit, low, high in definitions:
+    for label, key, digits, unit, low, target, high in definitions:
         item = stats.get(key)
         mean = float(item["mean"]) if item else None
         sensor_rows.append([
-            label, metric_text(item, digits, unit), f"{low:g}~{high:g} {unit}",
+            label, metric_text(item, digits, unit), f"{low:g}~{high:g} (목표 {target:g}) {unit}",
             status_for(mean, low, high),
         ])
     sensor_table = Table(sensor_rows, colWidths=[23 * mm, 70 * mm, 48 * mm, 35 * mm])
