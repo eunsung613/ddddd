@@ -2040,8 +2040,30 @@ def latest_sensors() -> dict[str, Any]:
 
 
 @app.get("/api/sensors/history", dependencies=[Depends(require_auth)])
-def sensor_history(hours: int = Query(24, ge=1, le=720)) -> list[dict[str, Any]]:
-    return store.sensor_history(hours)
+def sensor_history(
+    hours: int | None = Query(None, ge=1, le=2160),
+    start: str | None = None,
+    end: str | None = None,
+    max_points: int = Query(1600, ge=200, le=2500),
+) -> list[dict[str, Any]]:
+    """Read a preset or explicit Seoul-time range without returning an unbounded series."""
+    if bool(start) != bool(end):
+        raise HTTPException(400, "Provide both start and end timestamps")
+    if start and end:
+        try:
+            range_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            range_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise HTTPException(400, "Use ISO-8601 start and end timestamps") from error
+        if range_start.tzinfo is None:
+            range_start = range_start.replace(tzinfo=SEOUL)
+        if range_end.tzinfo is None:
+            range_end = range_end.replace(tzinfo=SEOUL)
+        range_start, range_end = range_start.astimezone(SEOUL), range_end.astimezone(SEOUL)
+        if range_end <= range_start or range_end - range_start > timedelta(days=90):
+            raise HTTPException(400, "Select a range from 1 minute to 90 days")
+        return store.sensor_history(limit=max_points, start=range_start, end=range_end)
+    return store.sensor_history(hours=hours or 24, limit=max_points)
 
 
 @app.get("/api/actuators", dependencies=[Depends(require_auth)])

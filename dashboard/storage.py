@@ -144,16 +144,41 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
-    def sensor_history(self, hours: int = 24, limit: int = 2000) -> list[dict[str, Any]]:
-        since = (datetime.now().astimezone() - timedelta(hours=hours)).isoformat(timespec="seconds")
+    def sensor_history(
+        self, hours: int = 24, limit: int = 1600,
+        start: datetime | None = None, end: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return a chronological, display-sized sensor series for a time range."""
+        end = end or datetime.now().astimezone()
+        start = start or (end - timedelta(hours=hours))
+        start_text = start.isoformat(timespec="seconds")
+        end_text = end.isoformat(timespec="seconds")
+        fields = "recorded_at, air_temp, humidity, co2, ec, ph, solution_temp, source"
         with self.connect() as db:
-            rows = db.execute(
-                """SELECT recorded_at, air_temp, humidity, co2, ec, ph,
-                          solution_temp, source
-                   FROM sensor_readings WHERE recorded_at >= ?
-                   ORDER BY recorded_at ASC LIMIT ?""",
-                (since, limit),
-            ).fetchall()
+            count = int(db.execute(
+                "SELECT COUNT(*) FROM sensor_readings WHERE recorded_at >= ? AND recorded_at <= ?",
+                (start_text, end_text),
+            ).fetchone()[0])
+            if count <= limit:
+                rows = db.execute(
+                    f"SELECT {fields} FROM sensor_readings WHERE recorded_at >= ? AND recorded_at <= ? "
+                    "ORDER BY recorded_at ASC",
+                    (start_text, end_text),
+                ).fetchall()
+            else:
+                seconds = max(1, int((end - start).total_seconds()))
+                bucket_seconds = max(1, (seconds + limit - 1) // limit)
+                rows = db.execute(
+                    """SELECT MIN(recorded_at) AS recorded_at,
+                              AVG(air_temp) AS air_temp, AVG(humidity) AS humidity,
+                              AVG(co2) AS co2, AVG(ec) AS ec, AVG(ph) AS ph,
+                              AVG(solution_temp) AS solution_temp, MAX(source) AS source
+                       FROM sensor_readings
+                       WHERE recorded_at >= ? AND recorded_at <= ?
+                       GROUP BY CAST(strftime('%s', recorded_at) / ? AS INTEGER)
+                       ORDER BY recorded_at ASC""",
+                    (start_text, end_text, bucket_seconds),
+                ).fetchall()
         return [dict(row) for row in rows]
 
     def day_stats(self, report_date: str) -> dict[str, dict[str, float | int] | None]:
