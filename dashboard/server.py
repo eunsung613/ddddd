@@ -1475,6 +1475,93 @@ def latest_capture_set() -> list[dict[str, Any]]:
     return [selected[key] for key in sorted(selected)]
 
 
+def stored_row_date(value: Any) -> date | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=SEOUL)
+        return parsed.astimezone(SEOUL).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def previous_day_stage_analysis() -> dict[str, Any] | None:
+    """Find the latest earlier-day AI result that has a usable growth stage."""
+    today = datetime.now(SEOUL).date()
+    for row in store.analyses(100):
+        result = dict(row.get("result") or {})
+        row_date = stored_row_date(row.get("created_at"))
+        if (
+            row_date is not None and row_date < today
+            and str(result.get("growth_stage") or "") in GROWTH_STAGE_PROFILES
+        ):
+            return row
+    return None
+
+
+def capture_set_for_date(capture_date: date | None) -> list[dict[str, Any]]:
+    """Return one existing successful camera image per view for a given day."""
+    if not capture_date:
+        return []
+    selected: dict[str, dict[str, Any]] = {}
+    for item in store.captures(500):
+        camera_id = str(item.get("camera_id") or "")
+        path = Path(str(item.get("path") or ""))
+        if (
+            camera_id and camera_id not in selected and item.get("status") == "success"
+            and stored_row_date(item.get("captured_at")) == capture_date and path.exists()
+        ):
+            selected[camera_id] = item
+    return [selected[key] for key in sorted(selected)]
+
+
+def stabilize_growth_stage(result: dict[str, Any], previous_row: dict[str, Any] | None,
+                           previous_capture_count: int) -> dict[str, Any]:
+    """Require strong, comparable evidence before a stage change can affect dosing."""
+    previous = dict((previous_row or {}).get("result") or {})
+    previous_stage = str(previous.get("growth_stage") or "")
+    proposed_stage = str(result.get("growth_stage") or DEFAULT_GROWTH_STAGE)
+    confidence = str(result.get("growth_stage_confidence") or "낮음")
+    reason = " ".join(str(result.get("growth_stage_reason") or "").split())
+    if not reason:
+        reason = "당일 사진에서 보이는 잎 수·크기·화구 유무를 근거로 분류했습니다."
+
+    result["growth_stage_reason"] = reason[:260]
+    if previous_stage not in GROWTH_STAGE_PROFILES:
+        result["growth_stage_comparison"] = "전일에 비교 가능한 생육 단계 기록이 없어 당일 사진 기준으로 분류했습니다."
+        result["growth_stage_transition"] = "비교 대상 없음"
+        return result
+
+    previous_date = stored_row_date((previous_row or {}).get("created_at"))
+    date_label = previous_date.isoformat() if previous_date else "전일"
+    if proposed_stage == previous_stage:
+        result["growth_stage_comparison"] = (
+            f"{date_label} {previous_stage} 판단과 동일합니다. {reason}"
+        )[:360]
+        result["growth_stage_transition"] = "유지"
+        return result
+
+    # A single medium/low-confidence photo classification must not change EC/pH
+    # thresholds.  It needs high confidence and a usable previous camera set.
+    if confidence != "높음" or previous_capture_count < 2:
+        result["growth_stage_proposed"] = proposed_stage
+        result["growth_stage"] = previous_stage
+        result["growth_stage_confidence"] = "낮음"
+        result["growth_stage_transition"] = "변경 보류"
+        result["growth_stage_comparison"] = (
+            f"{date_label}에는 {previous_stage}였고, 오늘은 {proposed_stage}로 제안됐습니다. "
+            f"하지만 전일 비교 근거가 충분하지 않거나 신뢰도가 {confidence}이므로 단계 변경을 보류하고 {previous_stage} 기준을 유지합니다."
+        )[:360]
+        return result
+
+    result["growth_stage_transition"] = "변경 확정"
+    result["growth_stage_comparison"] = (
+        f"{date_label} {previous_stage}에서 오늘 {proposed_stage}로 변경했습니다. "
+        f"전일·당일 카메라 {previous_capture_count}개 시야 비교와 높은 신뢰도 근거: {reason}"
+    )[:360]
+    return result
+
+
 def deterministic_analysis(latest: dict[str, Any], captures: list[dict[str, Any]]) -> dict[str, Any]:
     warnings = []
     for label, key, low, high in (
@@ -1501,16 +1588,33 @@ def deterministic_analysis(latest: dict[str, Any], captures: list[dict[str, Any]
         "confidence": "중간" if latest else "낮음",
         "growth_stage": DEFAULT_GROWTH_STAGE,
         "growth_stage_confidence": "낮음",
+        "growth_stage_reason": "규칙 기반 분석은 사진 생육 단계를 판독하지 않으므로 학교 기본 단계를 사용했습니다.",
         "nutrition_assessment": "AI 이미지 분석을 사용할 수 없어 학교 기본 단계 기준으로 EC·pH를 비교했습니다.",
         "observations": observations,
         "limitations": limitations + ["OpenAI API를 사용하지 않은 규칙 기반 결과"],
     }
 
 
-def openai_analysis(latest: dict[str, Any], captures: list[dict[str, Any]]) -> dict[str, Any]:
+def openai_analysis(latest: dict[str, Any], captures: list[dict[str, Any]],
+                    previous_row: dict[str, Any] | None = None,
+                    previous_captures: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return deterministic_analysis(latest, captures)
+    previous = dict((previous_row or {}).get("result") or {})
+    previous_date = stored_row_date((previous_row or {}).get("created_at"))
+    previous_captures = previous_captures or []
+    previous_context = (
+        "전일 비교 기록 없음"
+        if not previous else json.dumps({
+            "date": previous_date.isoformat() if previous_date else None,
+            "growth_stage": previous.get("growth_stage"),
+            "growth_stage_confidence": previous.get("growth_stage_confidence"),
+            "summary": previous.get("summary"),
+            "observations": list(previous.get("observations") or [])[:4],
+            "limitations": list(previous.get("limitations") or [])[:3],
+        }, ensure_ascii=False)
+    )
     content: list[dict[str, Any]] = [{
         "type": "input_text",
         "text": (
@@ -1518,13 +1622,18 @@ def openai_analysis(latest: dict[str, Any], captures: list[dict[str, Any]]) -> d
             "사진에서 직접 보이는 사실만 기록하라. 병해충을 확진하지 말고 제어 명령을 내리지 마라. "
             "서로 다른 카메라 3대의 사진을 하나의 농장 상태로 종합하되, 카메라별로 보이는 차이는 구분해 기록하라. "
             "사진과 센서 근거로 생육 단계를 육묘기·활착기·생육기·수확전 중 하나로 분류하되, "
+            "아래 전일 기록·전일 사진과 반드시 비교하라. 하루 만에 단계가 바뀌었다고 단정하지 말고, "
+            "전일과 다른 단계는 전일·당일 사진에서 직접 비교되는 변화가 명확할 때만 높은 신뢰도로 제안하라. "
+            "그렇지 않으면 growth_stage_confidence를 중간 또는 낮음으로 하고 comparison에 비교 불가 사유를 밝혀라. "
             "확신이 낮으면 학교 기본값인 육묘기를 사용했다고 limitations에 밝혀라. "
             "반드시 JSON 하나만 반환하라: "
             '{"overall_status":"정상|주의|경고|판단 불가","summary":"...",'
             '"confidence":"높음|중간|낮음","growth_stage":"육묘기|활착기|생육기|수확전",'
-            '"growth_stage_confidence":"높음|중간|낮음","nutrition_assessment":"...",'
+            '"growth_stage_confidence":"높음|중간|낮음","growth_stage_reason":"당일 사진의 직접 근거",'
+            '"growth_stage_comparison":"전일과 비교한 이유 또는 비교 제한", "nutrition_assessment":"...",'
             '"observations":["..."],"limitations":["..."]}. '
             "센서 데이터: " + json.dumps(latest, ensure_ascii=False, default=str)
+            + "\n전일 분석 기록: " + previous_context
         ),
     }]
     for capture in captures[:4]:
@@ -1534,6 +1643,20 @@ def openai_analysis(latest: dict[str, Any], captures: list[dict[str, Any]]) -> d
         image_bytes = path.read_bytes()
         camera_id = str(capture.get("camera_id") or "카메라")
         content.append({"type": "input_text", "text": f"다음 이미지는 {camera_id} 시야다."})
+        content.append({
+            "type": "input_image",
+            "image_url": "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii"),
+        })
+    for capture in previous_captures[:3]:
+        path = Path(str(capture.get("path") or ""))
+        if not path.exists():
+            continue
+        image_bytes = path.read_bytes()
+        camera_id = str(capture.get("camera_id") or "카메라")
+        content.append({
+            "type": "input_text",
+            "text": f"다음 이미지는 전일({previous_date.isoformat() if previous_date else '날짜 미상'}) {camera_id} 시야다. 당일 시야와 비교하라.",
+        })
         content.append({
             "type": "input_image",
             "image_url": "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii"),
@@ -1567,6 +1690,8 @@ def openai_analysis(latest: dict[str, Any], captures: list[dict[str, Any]]) -> d
                             "type": "string",
                             "enum": ["높음", "중간", "낮음"],
                         },
+                        "growth_stage_reason": {"type": "string"},
+                        "growth_stage_comparison": {"type": "string"},
                         "nutrition_assessment": {"type": "string"},
                         "observations": {
                             "type": "array",
@@ -1579,7 +1704,7 @@ def openai_analysis(latest: dict[str, Any], captures: list[dict[str, Any]]) -> d
                     },
                     "required": [
                         "overall_status", "summary", "confidence", "growth_stage",
-                        "growth_stage_confidence", "nutrition_assessment",
+                        "growth_stage_confidence", "growth_stage_reason", "growth_stage_comparison", "nutrition_assessment",
                         "observations", "limitations",
                     ],
                     "additionalProperties": False,
@@ -1648,6 +1773,9 @@ def create_rule_recommendations(latest: dict[str, Any], analysis: dict[str, Any]
                 "ec": ec, "lower_limit": profile["ec_low"], "target": f"{profile['ec_low']:.1f}~{profile['ec_high']:.1f}", "pump": "A+B",
                 "growth_stage": stage, "growth_profile": profile,
                 "analysis_confidence": (analysis or {}).get("growth_stage_confidence", "낮음"),
+                "growth_stage_reason": (analysis or {}).get("growth_stage_reason", ""),
+                "growth_stage_comparison": (analysis or {}).get("growth_stage_comparison", ""),
+                "growth_stage_transition": (analysis or {}).get("growth_stage_transition", "비교 대상 없음"),
                 "feedback_policy": nutrient_feedback_policy("ec"),
             }, "model": (analysis or {}).get("model"),
         })
@@ -1665,6 +1793,9 @@ def create_rule_recommendations(latest: dict[str, Any], analysis: dict[str, Any]
                 "ph": ph, "upper_limit": profile["ph_high"], "target": f"{profile['ph_low']:.1f}~{profile['ph_high']:.1f}", "pump": "acid",
                 "growth_stage": stage, "growth_profile": profile,
                 "analysis_confidence": (analysis or {}).get("growth_stage_confidence", "낮음"),
+                "growth_stage_reason": (analysis or {}).get("growth_stage_reason", ""),
+                "growth_stage_comparison": (analysis or {}).get("growth_stage_comparison", ""),
+                "growth_stage_transition": (analysis or {}).get("growth_stage_transition", "비교 대상 없음"),
                 "feedback_policy": nutrient_feedback_policy("ph"),
             }, "model": (analysis or {}).get("model"),
         })
@@ -1681,6 +1812,17 @@ def create_rule_recommendations(latest: dict[str, Any], analysis: dict[str, Any]
         note = "보정 시간 정책이 변경되어 새 텔레그램 승인 요청으로 교체"
         store.decide_recommendation(int(pending["id"]), "superseded", "system", note)
         record_decision_event(pending, int(pending["id"]), "superseded", "system", note)
+    recommendation_history = store.recommendations(200)
+    candidate_actuators = {str(item["actuator"]) for item in candidates if item.get("source") == "nutrient_feedback_rule"}
+    for pending in recommendation_history:
+        if pending.get("status") != "pending" or pending.get("source") != "nutrient_feedback_rule":
+            continue
+        evidence = dict(pending.get("evidence") or {})
+        pending_stage = str(evidence.get("growth_stage") or "")
+        if pending_stage != stage or str(pending.get("actuator")) not in candidate_actuators:
+            note = "새 전일 비교 분석 후 생육 단계 또는 실측 양액 기준이 달라져 승인 요청을 교체"
+            store.decide_recommendation(int(pending["id"]), "superseded", "system", note)
+            record_decision_event(pending, int(pending["id"]), "superseded", "system", note)
     recommendation_history = store.recommendations(200)
     pending_titles = {item["title"] for item in recommendation_history if item["status"] == "pending"}
     retry_titles = {
@@ -1702,16 +1844,19 @@ def create_rule_recommendations(latest: dict[str, Any], analysis: dict[str, Any]
 def run_analysis() -> dict[str, Any]:
     latest = store.latest_sensor() or {}
     captures = latest_capture_set()
+    previous_row = previous_day_stage_analysis()
+    previous_captures = capture_set_for_date(stored_row_date((previous_row or {}).get("created_at")))
     try:
         degraded_error = None
         try:
-            result = openai_analysis(latest, captures)
+            result = openai_analysis(latest, captures, previous_row, previous_captures)
         except Exception as error:
             # Keep the scheduled safety/status notification alive, but never label a
             # deterministic fallback as an AI observation.
             degraded_error = f"OpenAI unavailable: {type(error).__name__}: {str(error)[:180]}"
             result = deterministic_analysis(latest, captures)
             result["limitations"] = list(result.get("limitations", [])) + [degraded_error]
+        result = stabilize_growth_stage(result, previous_row, len(previous_captures))
         analysis_id = store.add_analysis(result)
         recommendation_ids = create_rule_recommendations(latest, result)
         store.workflow("ai_analysis", "degraded" if degraded_error else "success", f"analysis={analysis_id}; {degraded_error or 'OpenAI success'}")
@@ -1776,6 +1921,9 @@ def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], cap
     analysis_mode = "기본 안전 분석" if model == "rule-engine:no-ai" else "AI 사진·환경 분석"
     stage, profile = growth_stage_profile(analysis)
     nutrition = telegram_public_text(analysis.get("nutrition_assessment"), "센서값과 단계별 EC·pH 목표를 함께 확인합니다.")
+    stage_reason = telegram_public_text(analysis.get("growth_stage_reason"), "당일 사진에서 보이는 잎 상태를 기준으로 분류했습니다.")
+    stage_comparison = telegram_public_text(analysis.get("growth_stage_comparison"), "전일 비교 근거가 부족해 단계 변경 여부를 보수적으로 판단합니다.")
+    transition = telegram_public_text(analysis.get("growth_stage_transition"), "비교 대상 없음")
 
     return (
         "🥦 브로콜리 | 오늘의 상태\n"
@@ -1788,6 +1936,8 @@ def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], cap
         f"   EC {latest.get('ec', '--')} dS/m · pH {latest.get('ph', '--')}\n"
         f"🌱 생육 단계: {stage} (판단 {analysis.get('growth_stage_confidence', '낮음')})\n"
         f"   목표 EC {profile['ec_target']:.1f} · pH {profile['ph_target']:.1f}\n"
+        f"   판단 근거: {stage_reason}\n"
+        f"   🔁 전일 비교 ({transition}): {stage_comparison}\n"
         f"   영양 판단: {nutrition}\n"
         f"📷 최신 사진: {'첨부됨' if capture_available else '없음'}\n"
         f"🤖 분석 방식: {analysis_mode}\n"
@@ -1835,6 +1985,7 @@ def telegram_send_approval_requests(recommendation_ids: list[int], *, context: s
                 details.append(
                     f"🌱 AI 판단: {stage} (신뢰도 {evidence.get('analysis_confidence', '낮음')})\n"
                     f"🧪 현재 {label} {value}{unit} · 적정 범위 {target}\n"
+                    f"🔁 전일 비교: {telegram_public_text(evidence.get('growth_stage_comparison'), '전일 비교 근거를 확인해 주세요.')}\n"
                     f"💡 {item.get('rationale')}"
                 )
             else:

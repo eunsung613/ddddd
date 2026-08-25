@@ -14,6 +14,7 @@ from dashboard.server import (
     telegram_command_name,
     telegram_command_argument,
     telegram_daily_caption,
+    stabilize_growth_stage,
     word_chain_play,
     word_chain_start,
     word_chain_stop,
@@ -76,6 +77,20 @@ def main():
     if "봇: 차표" not in turn:
         raise AssertionError("word-chain did not continue the player turn: {!r}".format(turn))
     assert_equal(word_chain_stop("test-chat"), "🎮 끝말잇기를 종료했어요.", "word-chain stop")
+
+    previous = {"created_at": "2026-08-24T12:00:00+09:00", "result": {"growth_stage": "활착기"}}
+    held = stabilize_growth_stage({
+        "growth_stage": "생육기", "growth_stage_confidence": "중간",
+        "growth_stage_reason": "본엽이 관찰됨",
+    }, previous, 3)
+    assert_equal(held["growth_stage"], "활착기", "medium-confidence stage change held")
+    assert_equal(held["growth_stage_transition"], "변경 보류", "stage change hold label")
+    confirmed = stabilize_growth_stage({
+        "growth_stage": "생육기", "growth_stage_confidence": "높음",
+        "growth_stage_reason": "전일보다 잎 수와 크기가 뚜렷하게 증가함",
+    }, previous, 3)
+    assert_equal(confirmed["growth_stage"], "생육기", "high-confidence stage change accepted")
+    assert_equal(confirmed["growth_stage_transition"], "변경 확정", "stage change confirmation label")
     print("Telegram control tests passed")
 
 
