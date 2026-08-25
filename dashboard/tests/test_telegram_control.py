@@ -12,7 +12,11 @@ from dashboard.server import (
     telegram_approver_ids,
     telegram_callback_data,
     telegram_command_name,
+    telegram_command_argument,
     telegram_daily_caption,
+    word_chain_play,
+    word_chain_start,
+    word_chain_stop,
 )
 
 
@@ -29,6 +33,8 @@ def main():
     assert_equal(telegram_command_name("/report@brococolibot"), "/report", "report command")
     assert_equal(telegram_command_name("/help@brococolibot"), "/help", "help command")
     assert_equal(telegram_command_name("/stop@brococolibot"), "/stop", "stop command")
+    assert_equal(telegram_command_name("/wordchain@brococolibot 사과"), "/wordchain", "word-chain command")
+    assert_equal(telegram_command_argument("/끝말잇기 사과"), "사과", "word-chain opening word")
     assert_equal(telegram_approver_ids("12345, 67890"), {12345, 67890}, "approver IDs")
     assert_equal(telegram_approver_ids("12345\n67890"), {12345, 67890}, "approver IDs on separate lines")
     try:
@@ -62,6 +68,14 @@ def main():
     for hidden in ("OpenAI", "RateLimitError", "HTTP 429", "rule-engine:no-ai"):
         if hidden in caption:
             raise AssertionError("caption exposed technical detail {!r}".format(hidden))
+
+    start = word_chain_start("test-chat", "사과")
+    if "봇: 과자" not in start or "‘자’" not in start:
+        raise AssertionError("word-chain did not make a valid opening reply: {!r}".format(start))
+    turn = word_chain_play("test-chat", "자동차")
+    if "봇: 차표" not in turn:
+        raise AssertionError("word-chain did not continue the player turn: {!r}".format(turn))
+    assert_equal(word_chain_stop("test-chat"), "🎮 끝말잇기를 종료했어요.", "word-chain stop")
     print("Telegram control tests passed")
 
 

@@ -108,6 +108,22 @@ recommendation_lock = threading.Lock()
 nutrient_session_lock = threading.Lock()
 nutrient_session_cancel = threading.Event()
 nutrient_session_state: dict[str, Any] = {"actuator": None, "operator": None}
+word_chain_lock = threading.Lock()
+# This is intentionally an in-memory, non-farm feature.  A dashboard restart
+# simply ends a game; it never changes a sensor, recommendation, or relay.
+word_chain_games: dict[str, dict[str, Any]] = {}
+WORD_CHAIN_WORDS = (
+    "가방", "가위", "가을", "가수", "가구", "강아지", "거울", "고래", "과자", "구름",
+    "나비", "나라", "나무", "나비", "노래", "누나", "눈사람", "다리", "다람쥐", "도서관",
+    "라디오", "라면", "마음", "마차", "모자", "바다", "바나나", "비누", "사과", "사자",
+    "소나무", "수박", "시계", "아침", "아기", "우산", "여우", "여름", "오리", "유리",
+    "자전거", "자동차", "지우개", "차표", "책상", "초콜릿", "카메라", "코끼리", "토끼", "토마토",
+    "파도", "피아노", "하마", "하늘", "허수아비", "호랑이", "리본", "리모컨", "미소", "비행기",
+    "기차", "차례", "절구", "구두", "두부", "부엌", "억새", "새우", "우리",
+    "리듬", "음악", "악기", "기린", "인형", "형광등", "등대", "대나무", "무지개", "개나리",
+    "이불", "불꽃", "꽃병", "병원", "원숭이", "이야기", "기쁨", "새싹", "싹둑",
+)
+HANGUL_WORD_RE = re.compile(r"^[가-힣]{2,20}$")
 
 runtime_state: dict[str, Any] = {
     "pico_connected": False,
@@ -541,6 +557,69 @@ def telegram_command_name(text: str) -> str:
     return first.split("@", 1)[0]
 
 
+def telegram_command_argument(text: str) -> str:
+    """Return the optional words after a Telegram command."""
+    parts = (text or "").strip().split(maxsplit=1)
+    return parts[1].strip() if len(parts) == 2 else ""
+
+
+def word_chain_next_word(last_character: str, used: set[str]) -> str | None:
+    """Choose a deterministic unused Korean word that continues the chain."""
+    return next((word for word in WORD_CHAIN_WORDS if word.startswith(last_character) and word not in used), None)
+
+
+def word_chain_start(chat_id: str, opening_word: str = "") -> str:
+    """Start a chat-local Korean word-chain game without touching farm state."""
+    opening_word = opening_word.strip()
+    if opening_word and not HANGUL_WORD_RE.fullmatch(opening_word):
+        return "끝말잇기는 한글 단어 2~20글자로 시작해 주세요. 예: /끝말잇기 사과"
+    with word_chain_lock:
+        used: set[str] = set()
+        if opening_word:
+            used.add(opening_word)
+            bot_word = word_chain_next_word(opening_word[-1], used)
+            if not bot_word:
+                return f"‘{opening_word[-1]}’로 시작하는 준비 단어가 없어요. 다른 단어로 시작해 주세요."
+            used.add(bot_word)
+            word_chain_games[chat_id] = {"expected": bot_word[-1], "used": used}
+            return f"🎮 끝말잇기 시작!\n나: {opening_word}\n봇: {bot_word}\n\n다음은 ‘{bot_word[-1]}’로 시작하는 단어예요."
+
+        bot_word = "토마토"
+        word_chain_games[chat_id] = {"expected": bot_word[-1], "used": {bot_word}}
+        return f"🎮 끝말잇기 시작!\n봇이 먼저: {bot_word}\n\n‘{bot_word[-1]}’로 시작하는 단어를 보내 주세요."
+
+
+def word_chain_play(chat_id: str, word: str) -> str | None:
+    """Process one player turn and return a safe text response, if a game exists."""
+    word = word.strip()
+    with word_chain_lock:
+        game = word_chain_games.get(chat_id)
+        if not game:
+            return None
+        expected = str(game["expected"])
+        used = set(game["used"])
+        if not HANGUL_WORD_RE.fullmatch(word):
+            return "한글 단어 2~20글자를 보내 주세요. 그만두려면 /끝말그만"
+        if not word.startswith(expected):
+            return f"‘{expected}’로 시작하는 단어 차례예요."
+        if word in used:
+            return f"‘{word}’은(는) 이미 나온 단어예요. 다른 ‘{expected}’ 단어를 골라 주세요."
+        used.add(word)
+        bot_word = word_chain_next_word(word[-1], used)
+        if not bot_word:
+            word_chain_games.pop(chat_id, None)
+            return f"봇이 ‘{word[-1]}’로 이을 단어를 못 찾았어요. 이번 판은 당신 승리! 🏆\n다시 하려면 /끝말잇기"
+        used.add(bot_word)
+        word_chain_games[chat_id] = {"expected": bot_word[-1], "used": used}
+        return f"봇: {bot_word}\n\n다음은 ‘{bot_word[-1]}’로 시작하는 단어예요."
+
+
+def word_chain_stop(chat_id: str) -> str:
+    with word_chain_lock:
+        existed = word_chain_games.pop(chat_id, None) is not None
+    return "🎮 끝말잇기를 종료했어요." if existed else "진행 중인 끝말잇기가 없어요."
+
+
 def telegram_status_text() -> str:
     """A concise, measured status response for an authorized Telegram command."""
     latest = latest_with_health()
@@ -582,13 +661,25 @@ def telegram_message_authorized(message: dict[str, Any], config: dict[str, Any])
 
 
 def process_telegram_message(message: dict[str, Any]) -> None:
-    """Handle read-only group commands; this path never controls hardware."""
+    """Handle Telegram commands and the isolated, non-farm word-chain game."""
     try:
-        command = telegram_command_name(str(message.get("text") or ""))
-        if command not in {"/start", "/status", "/report", "/stop", "/help", "/commands"}:
+        text = str(message.get("text") or "")
+        command = telegram_command_name(text)
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        with word_chain_lock:
+            game_active = chat_id in word_chain_games
+        game_commands = {"/끝말잇기", "/wordchain", "/끝말그만", "/endgame"}
+        farm_commands = {"/start", "/status", "/report", "/stop", "/help", "/commands"}
+        if command not in farm_commands | game_commands and not game_active:
             return
         config = telegram_config()
         if not config["approvals_ready"] or not telegram_message_authorized(message, config):
+            return
+        if command in {"/끝말잇기", "/wordchain"}:
+            telegram_send_message(word_chain_start(chat_id, telegram_command_argument(text)))
+            return
+        if command in {"/끝말그만", "/endgame"}:
+            telegram_send_message(word_chain_stop(chat_id))
             return
         if command in {"/help", "/commands"}:
             telegram_send_message(
@@ -597,6 +688,8 @@ def process_telegram_message(message: dict[str, Any]) -> None:
                 "/status · 현재 센서·펌프·승인 대기 상태\n"
                 "/report · 최신 촬영, AI 분석, 사진 브리핑, PDF 보고서 생성\n"
                 "/stop · 진행 중 EC/pH 반복 보정과 교반 즉시 중지\n"
+                "/끝말잇기 [단어] 또는 /wordchain [단어] · 끝말잇기 시작\n"
+                "/끝말그만 또는 /endgame · 끝말잇기 종료\n"
                 "/help 또는 /commands · 이 명령어 목록\n\n"
                 "EC/pH 펌프는 Telegram 승인 버튼을 누른 경우에만 동작합니다."
             )
@@ -613,6 +706,10 @@ def process_telegram_message(message: dict[str, Any]) -> None:
             ).start()
         elif command == "/stop":
             telegram_send_message("🛑 " + cancel_nutrient_feedback(f"telegram:{(message.get('from') or {}).get('id')}"))
+        elif game_active:
+            response = word_chain_play(chat_id, text)
+            if response:
+                telegram_send_message(response)
         else:
             telegram_send_message(telegram_status_text())
     except (TypeError, ValueError, RuntimeError) as error:
