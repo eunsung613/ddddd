@@ -113,15 +113,17 @@ word_chain_lock = threading.Lock()
 # simply ends a game; it never changes a sensor, recommendation, or relay.
 word_chain_games: dict[str, dict[str, Any]] = {}
 WORD_CHAIN_WORDS = (
-    "가방", "가위", "가을", "가수", "가구", "강아지", "거울", "고래", "과자", "구름",
-    "나비", "나라", "나무", "나비", "노래", "누나", "눈사람", "다리", "다람쥐", "도서관",
-    "라디오", "라면", "마음", "마차", "모자", "바다", "바나나", "비누", "사과", "사자",
-    "소나무", "수박", "시계", "아침", "아기", "우산", "여우", "여름", "오리", "유리",
-    "자전거", "자동차", "지우개", "차표", "책상", "초콜릿", "카메라", "코끼리", "토끼", "토마토",
-    "파도", "피아노", "하마", "하늘", "허수아비", "호랑이", "리본", "리모컨", "미소", "비행기",
-    "기차", "차례", "절구", "구두", "두부", "부엌", "억새", "새우", "우리",
-    "리듬", "음악", "악기", "기린", "인형", "형광등", "등대", "대나무", "무지개", "개나리",
-    "이불", "불꽃", "꽃병", "병원", "원숭이", "이야기", "기쁨", "새싹", "싹둑",
+    # Each group deliberately joins a longer loop.  The game only selects
+    # words with further continuations, so it never sends a one-shot word.
+    "토마토", "토끼", "끼니", "니트", "트럭", "럭비", "비누", "비행기", "기차", "차표",
+    "표범", "범고래", "래퍼", "퍼즐", "즐거움", "음악", "악기",
+    "사과", "과자", "자전거", "자동차", "거울", "울타리", "울음", "리본", "본드", "드라마", "마차",
+    "가방", "방울", "가구", "구두", "두부", "부엌", "억새", "새우", "우리",
+    "나비", "나무", "누나", "누룽지", "무지개", "개나리", "지우개",
+    "바다", "바나나", "다리", "도서관", "관람차", "소나무", "수박", "박물관",
+    "아기", "아침", "우산", "산책", "책상", "상자", "여우", "오리", "유리",
+    "카메라", "코끼리", "라디오", "마음", "모자", "파도", "피아노", "노래",
+    "하마", "호랑이", "이야기", "이불", "불꽃", "꽃병", "병원", "원숭이",
 )
 HANGUL_WORD_RE = re.compile(r"^[가-힣]{2,20}$")
 
@@ -563,9 +565,38 @@ def telegram_command_argument(text: str) -> str:
     return parts[1].strip() if len(parts) == 2 else ""
 
 
+def word_chain_has_path(start_character: str, used: set[str], depth: int) -> bool:
+    """Return whether the curated dictionary can continue for ``depth`` more turns."""
+    if depth <= 0:
+        return True
+    for word in WORD_CHAIN_WORDS:
+        if word.startswith(start_character) and word not in used:
+            if word_chain_has_path(word[-1], used | {word}, depth - 1):
+                return True
+    return False
+
+
 def word_chain_next_word(last_character: str, used: set[str]) -> str | None:
-    """Choose a deterministic unused Korean word that continues the chain."""
-    return next((word for word in WORD_CHAIN_WORDS if word.startswith(last_character) and word not in used), None)
+    """Choose the trickiest word that still leaves at least two more safe turns."""
+    candidates = [
+        word for word in WORD_CHAIN_WORDS
+        if word.startswith(last_character)
+        and word not in used
+        and word_chain_has_path(word[-1], used | {word}, 2)
+    ]
+    if not candidates:
+        return None
+
+    def difficulty(word: str) -> tuple[int, int, str]:
+        next_turns = sum(
+            1 for next_word in WORD_CHAIN_WORDS
+            if next_word.startswith(word[-1])
+            and next_word not in used | {word}
+            and word_chain_has_path(next_word[-1], used | {word, next_word}, 1)
+        )
+        return (next_turns, -len(word), word)
+
+    return min(candidates, key=difficulty)
 
 
 def word_chain_start(chat_id: str, opening_word: str = "") -> str:
@@ -604,11 +635,13 @@ def word_chain_play(chat_id: str, word: str) -> str | None:
             return f"‘{expected}’로 시작하는 단어 차례예요."
         if word in used:
             return f"‘{word}’은(는) 이미 나온 단어예요. 다른 ‘{expected}’ 단어를 골라 주세요."
-        used.add(word)
-        bot_word = word_chain_next_word(word[-1], used)
+        bot_word = word_chain_next_word(word[-1], used | {word})
         if not bot_word:
-            word_chain_games.pop(chat_id, None)
-            return f"봇이 ‘{word[-1]}’로 이을 단어를 못 찾았어요. 이번 판은 당신 승리! 🏆\n다시 하려면 /끝말잇기"
+            return (
+                f"‘{word}’은(는) 한방단어라 사용할 수 없어요.\n"
+                f"상대가 계속 이을 수 있는 다른 ‘{expected}’ 단어를 골라 주세요."
+            )
+        used.add(word)
         used.add(bot_word)
         word_chain_games[chat_id] = {"expected": bot_word[-1], "used": used}
         return f"봇: {bot_word}\n\n다음은 ‘{bot_word[-1]}’로 시작하는 단어예요."
