@@ -14,6 +14,9 @@ def assert_equal(actual, expected, label):
 
 
 def main():
+    boot_source = (PICO_DIR / "main.py").read_text(encoding="utf-8")
+    if 'exec(open("smartfarm_runtime.py").read())' not in boot_source:
+        raise AssertionError("Pico main.py must start the offline runtime after reset")
     assert_equal(smartfarm_pins.RELAY_OFF, 0, "active-HIGH OFF level")
     assert_equal(smartfarm_pins.RELAY_ON, 1, "active-HIGH ON level")
     assert_equal(
