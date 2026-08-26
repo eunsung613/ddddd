@@ -10,6 +10,11 @@ import time
 from machine import I2C, Pin
 
 try:
+    from machine import WDT
+except ImportError:
+    WDT = None
+
+try:
     import ujson as json
 except ImportError:
     import json
@@ -23,9 +28,12 @@ import config
 from smartfarm_pins import (
     ACTUATOR_OUTPUTS_ARMED,
     LED_SCHEDULE_OUTPUT_ARMED,
+    LOCAL_SUPPLY_CONTINUOUS_ENABLED,
     RELAY_OFF,
     RELAY_ON,
     RELAY_PINS,
+    WATCHDOG_ENABLED,
+    WATCHDOG_TIMEOUT_MS,
 )
 from sensors.pe350 import (
     PE350Modbus,
@@ -156,17 +164,41 @@ class EnvironmentSensors:
 
 relays = {}
 deadlines = {}
+local_supply_continuous = bool(LOCAL_SUPPLY_CONTINUOUS_ENABLED)
 for name, pin_number in RELAY_PINS.items():
     relays[name] = Pin(pin_number, Pin.OUT, value=RELAY_OFF)
 
 
-def all_off():
+def all_off(disable_local_supply=False):
+    """Turn every relay off; an explicit all-off is also a local override."""
+    global local_supply_continuous
     for relay in relays.values():
         relay.value(RELAY_OFF)
     deadlines.clear()
+    if disable_local_supply:
+        local_supply_continuous = False
+
+
+def apply_local_supply_policy():
+    """Keep only the circulation pump alive when the host/network disappears."""
+    if not local_supply_continuous or not ACTUATOR_OUTPUTS_ARMED:
+        return
+    relays["supply"].value(RELAY_ON)
+    deadlines.pop("supply", None)
+
+
+def make_watchdog():
+    if not WATCHDOG_ENABLED or WDT is None:
+        return None
+    try:
+        return WDT(timeout=int(WATCHDOG_TIMEOUT_MS))
+    except Exception as error:
+        emit("RUNTIME_JSON:", {"status": "watchdog_unavailable", "error": str(error)})
+        return None
 
 
 def set_relay(name, turn_on, duration_seconds=0):
+    global local_supply_continuous
     if name not in relays:
         raise ValueError("Unknown actuator: " + str(name))
     if turn_on:
@@ -181,10 +213,18 @@ def set_relay(name, turn_on, duration_seconds=0):
         if duration_seconds <= 0 or duration_seconds > MAX_ON_SECONDS[name]:
             raise ValueError("Invalid duration for " + name)
         relays[name].value(RELAY_ON)
-        deadlines[name] = time.ticks_add(time.ticks_ms(), duration_seconds * 1000)
+        if name == "supply" and LOCAL_SUPPLY_CONTINUOUS_ENABLED:
+            # A server outage must not let a 24-hour host-issued timeout stop
+            # the circulation pump.  An explicit all_off remains available.
+            local_supply_continuous = True
+            deadlines.pop(name, None)
+        else:
+            deadlines[name] = time.ticks_add(time.ticks_ms(), duration_seconds * 1000)
     else:
         relays[name].value(RELAY_OFF)
         deadlines.pop(name, None)
+        if name == "supply":
+            local_supply_continuous = False
 
 
 def expire_relays():
@@ -208,7 +248,7 @@ def handle_command(line):
     try:
         action = command.get("action")
         if action == "all_off":
-            all_off()
+            all_off(disable_local_supply=True)
             emit("ACK_JSON:", {"cmd_id": cmd_id, "result": "ok", "state": "all_off"})
             return
         if action != "set":
@@ -258,11 +298,16 @@ def read_telemetry(environment, pe350):
 
 def main():
     all_off()
+    watchdog = make_watchdog()
+    apply_local_supply_policy()
     emit("RUNTIME_JSON:", {
         "status": "starting",
-        "relays": "all_off",
+        "relays": "supply_on_local" if local_supply_continuous else "all_off",
         "actuator_outputs_armed": ACTUATOR_OUTPUTS_ARMED,
         "led_schedule_output_armed": LED_SCHEDULE_OUTPUT_ARMED,
+        "local_supply_continuous": local_supply_continuous,
+        "watchdog_enabled": watchdog is not None,
+        "watchdog_timeout_ms": WATCHDOG_TIMEOUT_MS if watchdog is not None else None,
     })
     environment = EnvironmentSensors()
     pe350 = PE350Modbus()
@@ -271,7 +316,10 @@ def main():
     last_telemetry = time.ticks_add(time.ticks_ms(), -TELEMETRY_INTERVAL_MS)
 
     while True:
+        if watchdog:
+            watchdog.feed()
         expire_relays()
+        apply_local_supply_policy()
         if poll.poll(0):
             handle_command(sys.stdin.readline().strip())
 
@@ -282,6 +330,8 @@ def main():
                 emit("TELEMETRY_JSON:", read_telemetry(environment, pe350))
             except Exception as error:
                 emit("TELEMETRY_ERROR:", {"error": str(error)})
+        if watchdog:
+            watchdog.feed()
         time.sleep_ms(20)
 
 

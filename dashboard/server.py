@@ -134,6 +134,7 @@ runtime_state: dict[str, Any] = {
     "updated_at_epoch": None,
     "actuators": {name: "off" for name in ACTUATORS},
     "last_ack": None,
+    "pico_runtime": {},
     "sensor_errors": {},
     "mqtt_connected": False,
     "mqtt_error": None,
@@ -948,6 +949,9 @@ def process_serial_line(line: str) -> None:
                 "result": result,
                 "note": "Pico 응답: " + str(ack.get("result", "unknown")),
             })
+    elif line.startswith("RUNTIME_JSON:"):
+        payload = json.loads(line.split(":", 1)[1])
+        update_runtime(pico_runtime=payload)
     elif line.startswith("TELEMETRY_ERROR:"):
         payload = json.loads(line.split(":", 1)[1])
         update_runtime(last_error=payload.get("error", "Pico telemetry error"))
@@ -2281,6 +2285,7 @@ def health() -> dict[str, Any]:
         "dashboard_auth_configured": bool(os.getenv("DASHBOARD_USERNAME") and os.getenv("DASHBOARD_PASSWORD")),
         "camera_count": len(camera_configs()), "database_path": str(DB_PATH),
         "pico_error": latest.get("error"),
+        "pico_runtime": runtime_state.get("pico_runtime", {}),
         "mqtt": mqtt_status,
     }
 
