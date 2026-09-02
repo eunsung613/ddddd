@@ -241,7 +241,8 @@ class Store:
             for field in ("air_temp", "humidity", "co2", "ec", "ph", "solution_temp"):
                 row = db.execute(
                     f"""SELECT COUNT({field}) AS count, AVG({field}) AS mean,
-                               MIN({field}) AS minimum, MAX({field}) AS maximum
+                               MIN({field}) AS minimum, MAX({field}) AS maximum,
+                               MIN(recorded_at) AS first_at, MAX(recorded_at) AS last_at
                         FROM sensor_readings
                         WHERE substr(recorded_at, 1, 10) = ? AND {field} IS NOT NULL""",
                     (report_date,),

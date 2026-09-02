@@ -1279,15 +1279,63 @@ def management_growth_score(
 
     all_sensor_groups = bool(latest.get("temperature_humidity_connected") and latest.get("pe350_connected") and (latest.get("co2_connected") or not latest.get("co2_required")))
     sample_counts = [int((stats.get(key) or {}).get("count") or 0) for key in ("ec", "ph", "air_temp", "humidity", "co2")]
-    evidence_points = (5.0 if measured and fresh and all_sensor_groups else 0.0) + (5.0 if min(sample_counts or [0]) >= 6 else 0.0)
+    live_evidence_ok = bool(measured and fresh and all_sensor_groups)
+    sample_evidence_ok = bool(min(sample_counts or [0]) >= 6)
+    evidence_points = (5.0 if live_evidence_ok else 0.0) + (5.0 if sample_evidence_ok else 0.0)
     analysis_today = stored_row_date((analysis_row or {}).get("created_at")) == datetime.now(SEOUL).date()
     evidence_points += 3.0 if analysis_today else 0.0
-    evidence_points += 2.0 if latest_capture_set() and analysis_today else 0.0
+    capture_set = latest_capture_set()
+    capture_evidence_ok = bool(capture_set and analysis_today)
+    evidence_points += 2.0 if capture_evidence_ok else 0.0
     evidence_detail = []
     evidence_detail.append("센서 실측 정상" if measured and fresh and all_sensor_groups else "센서 근거 확인 필요")
     evidence_detail.append(f"오늘 표본 {min(sample_counts or [0])}개 이상" if min(sample_counts or [0]) >= 6 else "오늘 표본 부족")
     evidence_detail.append("오늘 사진·AI 관찰 있음" if analysis_today and latest_capture_set() else "오늘 사진·AI 관찰 미입력")
     components.append({"key": "evidence", "label": "근거 품질", "status": "실측" if evidence_points >= 10 else "확인 필요", "points": round(evidence_points, 1), "out_of": 15.0, "detail": " · ".join(evidence_detail)})
+
+    evidence_metric_specs = {
+        "ec": ("EC", "dS/m", 3), "ph": ("pH", "", 2), "air_temp": ("기온", "℃", 1),
+        "humidity": ("습도", "%", 1), "co2": ("CO₂", "ppm", 0),
+    }
+    evidence_samples = []
+    for key, (label, unit, digits) in evidence_metric_specs.items():
+        item = dict(stats.get(key) or {})
+        evidence_samples.append({
+            "key": key, "label": label, "unit": unit, "digits": digits,
+            "count": int(item.get("count") or 0), "mean": item.get("mean"),
+            "minimum": item.get("minimum"), "maximum": item.get("maximum"),
+            "first_at": item.get("first_at"), "last_at": item.get("last_at"),
+        })
+    evidence = {
+        "report_date": report_date,
+        "timezone": "Asia/Seoul",
+        "measured_at": latest.get("recorded_at"),
+        "source": latest.get("source"),
+        "sampling_policy": {
+            "required_samples": 6, "freshness_limit_seconds": SENSOR_STALE_SECONDS,
+            "latest_age_seconds": latest.get("age_seconds"),
+            "description": "당일 SQLite 원본 행을 항목별로 집계하며, 점수에는 가장 최근의 신선한 실측값과 당일 변동폭을 함께 사용합니다.",
+        },
+        "point_breakdown": [
+            {"label": "실시간 실측 연결", "possible": 5.0, "awarded": 5.0 if live_evidence_ok else 0.0, "ok": live_evidence_ok, "rule": f"Pico 연결 · {SENSOR_STALE_SECONDS}초 이내 수신 · 필수 센서군 정상"},
+            {"label": "당일 표본 충족", "possible": 5.0, "awarded": 5.0 if sample_evidence_ok else 0.0, "ok": sample_evidence_ok, "rule": "EC·pH·기온·습도·CO₂ 각각 6개 이상"},
+            {"label": "당일 AI 사진 관찰", "possible": 3.0, "awarded": 3.0 if analysis_today else 0.0, "ok": analysis_today, "rule": "오늘 생성된 AI 분석 기록 1건 이상"},
+            {"label": "당일 촬영 근거", "possible": 2.0, "awarded": 2.0 if capture_evidence_ok else 0.0, "ok": capture_evidence_ok, "rule": "오늘의 성공한 카메라 촬영 1대 이상과 AI 분석이 함께 존재"},
+        ],
+        "sensor_checks": [
+            {"label": "SHTC3 온·습도", "unit_address": 1, "baudrate": 9600, "ok": bool(latest.get("temperature_humidity_connected")), "detail": "기온·습도 실측값 수신"},
+            {"label": "KCD-HP100 CO₂", "unit_address": 31, "baudrate": 38400, "ok": bool(latest.get("co2_connected")), "detail": "CO₂ 실측값 수신"},
+            {"label": "SenseCube PE350", "unit_address": 21, "baudrate": 9600, "ok": bool(latest.get("pe350_connected")), "detail": "EC·pH·양액온도 실측값 수신"},
+        ],
+        "samples": evidence_samples,
+        "ai_record": {
+            "id": (analysis_row or {}).get("id"), "created_at": (analysis_row or {}).get("created_at"),
+            "model": (analysis_row or {}).get("model"), "status": analysis.get("overall_status"),
+            "confidence": analysis.get("confidence"), "included_today": analysis_today,
+        },
+        "captures": [{"id": item.get("id"), "camera_id": item.get("camera_id"), "captured_at": item.get("captured_at")} for item in capture_set],
+        "interpretation": "AI 사진 관찰은 EC·pH·기온·습도·CO₂ 실측값이나 변동 안정성 점수를 바꾸지 않습니다. 근거 품질 항목에서만 최대 5점을 더합니다.",
+    }
 
     required_missing = [item for item in missing if item in {"EC", "pH", "기온", "습도"}] + (["CO₂"] if latest.get("co2_required") and "CO₂" in missing else [])
     score = None if required_missing or not measured or not fresh else int(round(sum(item["points"] for item in components)))
@@ -1319,7 +1367,7 @@ def management_growth_score(
     return {
         "name": "관리 환경 점수", "score": score, "out_of": 100, "status": status, "stage": stage, "profile": profile,
         "source": "실측" if measured else "모의/출처 확인 필요", "measured_at": latest.get("recorded_at"),
-        "components": components, "reasons": reasons,
+        "components": components, "reasons": reasons, "evidence": evidence,
         "confidence": "높음" if score is not None and evidence_points >= 13 else "제한적",
         "missing": required_missing,
         "ai_observation": {
