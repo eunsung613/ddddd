@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any
 
 from reportlab.lib import colors
@@ -28,6 +29,20 @@ DISCLAIMER = (
     "본 보고서는 영상 및 센서 데이터에 기반한 생육 의사결정 지원 자료이며, "
     "병해충과 생리장해의 확정 진단을 대체하지 않는다."
 )
+
+# These names are retained in a few historical database/MQTT compatibility
+# columns, but they are not part of the installed sensor system any more.
+# Never let a model echo those empty compatibility fields into a human report.
+_LEGACY_SENSOR_TEXT = re.compile(r"(?:i2c|aht\d*|scd\d*|bh1750|null|none)", re.IGNORECASE)
+RS485_SENSOR_SYSTEM = "RS485 Modbus RTU · SHTC3 온습도 · KCD-HP100 CO₂ · SenseCube PE350 EC/pH·양액온도"
+
+
+def report_text(value: Any, fallback: str = "") -> str:
+    """Keep report prose human-readable and limited to the installed sensors."""
+    text = " ".join(str(value or "").split())
+    if not text or _LEGACY_SENSOR_TEXT.search(text):
+        return fallback
+    return text
 
 
 def register_korean_font(base_dir: Path) -> str:
@@ -61,6 +76,30 @@ def status_for(value: float | None, low: float, high: float) -> str:
     return "정상" if low <= value <= high else "주의"
 
 
+def effect_metric(snapshot: dict[str, Any] | None, key: str, digits: int, unit: str) -> str:
+    if not snapshot or snapshot.get(key) is None:
+        return "미수집"
+    return f"{float(snapshot[key]):.{digits}f}{unit}"
+
+
+def effect_time_and_source(snapshot: dict[str, Any] | None) -> str:
+    if not snapshot:
+        return "미수집"
+    recorded_at = str(snapshot.get("recorded_at") or "")[:19].replace("T", " ")
+    source = str(snapshot.get("source") or "출처 확인 필요")
+    if source.startswith("measured"):
+        source = "실측"
+    elif source.startswith("simulation"):
+        source = "모의"
+    return f"{recorded_at} · {source}"
+
+
+def signed_change(value: float | None, digits: int, unit: str) -> str:
+    if value is None:
+        return "산출 불가"
+    return f"{value:+.{digits}f}{unit} (계산)"
+
+
 def generate_daily_pdf(
     output_path: Path,
     report_date: str,
@@ -71,8 +110,10 @@ def generate_daily_pdf(
     data_source: str,
     base_dir: Path,
     actuator_events: list[dict[str, Any]] | None = None,
+    intervention_effects: list[dict[str, Any]] | None = None,
     growth_stage: str = "육묘기",
     management_profile: dict[str, float] | None = None,
+    growth_score: dict[str, Any] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     font = register_korean_font(base_dir)
@@ -103,6 +144,7 @@ def generate_daily_pdf(
         ["보고 기준일", report_date, "작물", "브로콜리"],
         ["담당", "이은성 · 김태현", "확인", "유혜진 (인)"],
         ["분석 모델", model, "데이터 구분", f"{data_source} · AI 관찰"],
+        ["센서 통신", "RS485 Modbus RTU", "실측 장치", "SHTC3 · KCD-HP100 · PE350"],
         ["생성 시각", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"), "승인 상태", "사람 검토 대기"],
     ]
     meta_table = Table(metadata, colWidths=[28 * mm, 60 * mm, 28 * mm, 60 * mm])
@@ -122,7 +164,10 @@ def generate_daily_pdf(
 
     if analysis:
         overall = analysis.get("result", analysis).get("overall_status", "판단 불가")
-        summary = analysis.get("result", analysis).get("summary", "AI 분석 내용 없음")
+        summary = report_text(
+            analysis.get("result", analysis).get("summary"),
+            "당일 카메라 영상과 RS485 실측값을 기준으로 생육 상태를 검토했습니다.",
+        )
         confidence = analysis.get("result", analysis).get("confidence", "낮음")
     else:
         overall, summary, confidence = "판단 불가", "당일 AI 분석 기록이 없습니다.", "낮음"
@@ -132,8 +177,15 @@ def generate_daily_pdf(
         "temp_low": 15.0, "temp_target": 19.0, "temp_high": 22.0,
         "humidity_low": 60.0, "humidity_target": 68.0, "humidity_high": 75.0,
     }
+    score = growth_score or {}
+    score_value = score.get("score")
+    score_text = f"{score_value}/100 · {score.get('status', '판단 불가')}" if score_value is not None else "산출 불가 · 실측 근거 확인 필요"
+    score_reasons = " / ".join(str(item) for item in score.get("reasons", [])[:2]) or "근거 미입력"
     story.append(Table(
-        [["종합 상태", overall], ["생육 단계", growth_stage], ["분석 요약", Paragraph(summary, normal)], ["확신도", confidence]],
+        [
+            ["관리 환경 점수", score_text], ["점수 근거", Paragraph(score_reasons, normal)],
+            ["종합 상태", overall], ["생육 단계", growth_stage], ["분석 요약", Paragraph(summary, normal)], ["확신도", confidence],
+        ],
         colWidths=[30 * mm, 146 * mm],
         style=TableStyle([
             ("FONTNAME", (0, 0), (-1, -1), font),
@@ -146,7 +198,7 @@ def generate_daily_pdf(
         ]),
     ))
 
-    story.append(Paragraph("2. 환경 데이터 자동 판정", section))
+    story.append(Paragraph("2. RS485 실측 환경 데이터 자동 판정", section))
     sensor_rows = [["항목", f"일평균 (최소~최대) · {data_source}", f"{growth_stage} 관리 기준", "판정"]]
     definitions = (
         ("EC", "ec", 2, "dS/m", profile["ec_low"], profile["ec_target"], profile["ec_high"]),
@@ -183,7 +235,9 @@ def generate_daily_pdf(
             continue
         try:
             image = Image(str(path))
-            max_width, max_height = 52 * mm, 42 * mm
+            # A compact evidence strip keeps the daily report to two readable pages
+            # when actuator-effect cards are present below.
+            max_width, max_height = 52 * mm, 30 * mm
             scale = min(max_width / image.imageWidth, max_height / image.imageHeight)
             image.drawWidth = image.imageWidth * scale
             image.drawHeight = image.imageHeight * scale
@@ -212,11 +266,13 @@ def generate_daily_pdf(
     limitations = []
     if analysis:
         result = analysis.get("result", analysis)
-        observations = result.get("observations", [])
-        limitations = result.get("limitations", [])
+        observations = [report_text(value) for value in result.get("observations", [])]
+        limitations = [report_text(value) for value in result.get("limitations", [])]
+        observations = [value for value in observations if value]
+        limitations = [value for value in limitations if value]
     evidence_rows = [["구분", "기록"]]
-    evidence_rows.extend([["AI 관찰", Paragraph(str(value), normal)] for value in observations[:3]])
-    evidence_rows.extend([["분석 한계", Paragraph(str(value), normal)] for value in limitations[:3]])
+    evidence_rows.extend([["AI 관찰", Paragraph(str(value), normal)] for value in observations[:2]])
+    evidence_rows.extend([["분석 한계", Paragraph(str(value), normal)] for value in limitations[:2]])
     if len(evidence_rows) == 1:
         evidence_rows.append(["판단 불가", "영상 분석 기록 없음"])
     evidence_table = Table(evidence_rows, colWidths=[30 * mm, 146 * mm])
@@ -231,7 +287,7 @@ def generate_daily_pdf(
     ]))
     story.append(evidence_table)
 
-    story.append(Paragraph("4. 액추에이터 제어 감사 기록", section))
+    story.append(Paragraph("4. 조치 효과 카드 - 전후 센서 실측", section))
     actuator_labels = {
         "led": "LED", "raw_water": "원수", "supply": "양액 공급",
         "mixing": "교반", "ec": "A+B 양액펌프", "ph": "pH 산성액펌프", "fan": "환풍기",
@@ -245,15 +301,58 @@ def generate_daily_pdf(
         "deferred": "보정 대기",
     }
     events = actuator_events or []
+    effects = intervention_effects or []
+    if effects:
+        story.append(Paragraph(
+            "조치 전후의 가장 가까운 센서 실측값을 비교한 기록입니다. 변화의 원인을 단정하지 않으며, "
+            "센서 지연 또는 동시 조치가 있으면 현장 검토가 필요합니다.", small,
+        ))
+        # Keep the established two-page daily report readable. The complete
+        # actuator audit trail remains in SQLite; the PDF carries recent evidence.
+        # The latest complete intervention is printed as a full evidence card.
+        # Older cards stay in the audit database so that the daily report remains
+        # a practical two-page handout.
+        for effect in effects[-1:]:
+            actuator = str(effect.get("actuator") or "")
+            label = actuator_labels.get(actuator, actuator or "조치")
+            started = str(effect.get("started_at") or "")[:19].replace("T", " ")
+            pulses = int(effect.get("pulse_count") or 0)
+            seconds = int(effect.get("total_seconds") or 0)
+            action_detail = f"{label} · {started} · {pulses}회 / 총 {seconds}초"
+            before = effect.get("before")
+            after = effect.get("after")
+            card_rows = [
+                [Paragraph(f"<b>{action_detail}</b>", normal), "", "", ""],
+                ["구분", "pH", "EC", "시각 · 데이터 출처"],
+                ["조치 전 (실측)", effect_metric(before, "ph", 2, ""), effect_metric(before, "ec", 3, " dS/m"), effect_time_and_source(before)],
+                ["조치 후 (실측)", effect_metric(after, "ph", 2, ""), effect_metric(after, "ec", 3, " dS/m"), effect_time_and_source(after)],
+                ["변화", signed_change(effect.get("ph_change"), 2, ""), signed_change(effect.get("ec_change"), 3, " dS/m"), Paragraph(str(effect.get("observation_note") or "판단 불가"), small)],
+            ]
+            card = Table(card_rows, colWidths=[34 * mm, 30 * mm, 36 * mm, 76 * mm])
+            card.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (-1, -1), font),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("SPAN", (0, 0), (-1, 0)),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf2fb")),
+                ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#dddddd")),
+                ("BACKGROUND", (0, 4), (-1, 4), colors.HexColor("#f7f7f7")),
+                ("GRID", (0, 1), (-1, -1), 0.55, colors.HexColor("#999999")),
+                ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#777777")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 1), (2, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story.extend([card, Spacer(1, 3 * mm)])
+    else:
+        story.append(Paragraph("당일 조치와 연결할 전후 실측 센서 기록이 없습니다.", normal))
     if events:
         result_counts: dict[str, int] = {}
         for event in events:
             result = result_labels.get(str(event.get("result")), str(event.get("result") or "기록"))
             result_counts[result] = result_counts.get(result, 0) + 1
         summary = " · ".join(f"{label} {count}건" for label, count in sorted(result_counts.items()))
-        story.append(Paragraph(
-            f"금일 제어 감사 기록 {len(events)}건은 서버 DB에 전체 보존되었습니다. 요약: {summary}", normal
-        ))
+        story.append(Paragraph(f"금일 제어 감사 기록 {len(events)}건은 서버 DB에 전체 보존되었습니다. 요약: {summary}", small))
     else:
         story.append(Paragraph("당일 기록된 액추에이터 요청·승인·전송·응답 이력이 없습니다.", normal))
 

@@ -7,7 +7,7 @@ are forced OFF at boot. PE350 access remains read-only (Modbus function 0x04).
 import sys
 import time
 
-from machine import I2C, Pin
+from machine import Pin
 
 try:
     from machine import WDT
@@ -41,10 +41,9 @@ from sensors.pe350 import (
     ph_raw_to_ph,
     temperature_raw_to_c,
 )
+from sensors.rs485_environment import EnvironmentSensors
 
 
-AHT10_ADDRESS = 0x38
-SCD40_ADDRESS = 0x62
 TELEMETRY_INTERVAL_MS = 5000
 
 # Conservative device-side limits. The server applies the same or stricter limits.
@@ -53,7 +52,7 @@ MAX_ON_SECONDS = {
     "raw_water": 60,
     "supply": 86400,
     "mixing": 300,
-    "ec": 10,
+    "ec": 15,
     "ph": 5,
     "fan": 1800,
 }
@@ -61,105 +60,6 @@ MAX_ON_SECONDS = {
 
 def emit(prefix, payload):
     print(prefix + json.dumps(payload))
-
-
-def crc8(data):
-    crc = 0xFF
-    for value in data:
-        crc ^= value
-        for _ in range(8):
-            if crc & 0x80:
-                crc = ((crc << 1) ^ 0x31) & 0xFF
-            else:
-                crc = (crc << 1) & 0xFF
-    return crc
-
-
-def read_word(data, index):
-    value_bytes = data[index:index + 2]
-    if crc8(value_bytes) != data[index + 2]:
-        raise ValueError("SCD40 CRC error")
-    return (value_bytes[0] << 8) | value_bytes[1]
-
-
-class EnvironmentSensors:
-    def __init__(self):
-        self.i2c = I2C(
-            config.I2C_ID,
-            sda=Pin(config.I2C_SDA_PIN),
-            scl=Pin(config.I2C_SCL_PIN),
-            freq=100000,
-        )
-        devices = self.i2c.scan()
-        self.aht10_available = AHT10_ADDRESS in devices
-        self.scd40_enabled = bool(getattr(config, "SCD40_ENABLED", True))
-        self.scd40_available = self.scd40_enabled and SCD40_ADDRESS in devices
-        self.startup_errors = {}
-
-        if self.aht10_available:
-            try:
-                self.i2c.writeto(AHT10_ADDRESS, b"\xE1\x08\x00")
-                time.sleep_ms(20)
-            except Exception as error:
-                self.aht10_available = False
-                self.startup_errors["aht10"] = str(error)
-        else:
-            self.startup_errors["aht10"] = "not found at 0x38"
-
-        if self.scd40_available:
-            try:
-                self.i2c.writeto(SCD40_ADDRESS, b"\x21\xB1")
-                time.sleep_ms(5000)
-            except Exception as error:
-                self.scd40_available = False
-                self.startup_errors["scd40"] = str(error)
-        elif self.scd40_enabled:
-            self.startup_errors["scd40"] = "not found at 0x62"
-
-    def read(self):
-        payload = {}
-        errors = dict(self.startup_errors)
-
-        if self.aht10_available:
-            try:
-                self.i2c.writeto(AHT10_ADDRESS, b"\xAC\x33\x00")
-                time.sleep_ms(100)
-                aht = self.i2c.readfrom(AHT10_ADDRESS, 6)
-                if aht[0] & 0x80:
-                    raise RuntimeError("AHT10 is busy")
-                raw_humidity = (aht[1] << 12) | (aht[2] << 4) | (aht[3] >> 4)
-                raw_temperature = ((aht[3] & 0x0F) << 16) | (aht[4] << 8) | aht[5]
-                payload["air_temp"] = round(
-                    raw_temperature * 200.0 / 1048576 - 50.0,
-                    2,
-                )
-                payload["humidity"] = round(
-                    raw_humidity * 100.0 / 1048576,
-                    2,
-                )
-                errors.pop("aht10", None)
-            except Exception as error:
-                errors["aht10"] = str(error)
-
-        if self.scd40_available:
-            try:
-                self.i2c.writeto(SCD40_ADDRESS, b"\xEC\x05")
-                time.sleep_ms(10)
-                scd = self.i2c.readfrom(SCD40_ADDRESS, 9)
-                payload["co2"] = int(read_word(scd, 0))
-                payload["scd40_temp"] = round(
-                    -45.0 + 175.0 * read_word(scd, 3) / 65535,
-                    2,
-                )
-                payload["scd40_humidity"] = round(
-                    100.0 * read_word(scd, 6) / 65535,
-                    2,
-                )
-                errors.pop("scd40", None)
-            except Exception as error:
-                errors["scd40"] = str(error)
-
-        return payload, errors
 
 
 relays = {}
@@ -309,8 +209,10 @@ def main():
         "watchdog_enabled": watchdog is not None,
         "watchdog_timeout_ms": WATCHDOG_TIMEOUT_MS if watchdog is not None else None,
     })
+    # One owner for UART0/DE/RE avoids intermittent RS485 lockups caused by
+    # separate driver instances reinitialising the same hardware peripheral.
     environment = EnvironmentSensors()
-    pe350 = PE350Modbus()
+    pe350 = PE350Modbus(environment.uart, environment.de, environment.re)
     poll = select.poll()
     poll.register(sys.stdin, select.POLLIN)
     last_telemetry = time.ticks_add(time.ticks_ms(), -TELEMETRY_INTERVAL_MS)

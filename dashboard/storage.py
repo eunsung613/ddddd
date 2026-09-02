@@ -91,6 +91,16 @@ class Store:
                     result_json TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS historical_operation_analyses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    prompt_text TEXT NOT NULL,
+                    input_text TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    result_json TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS reports (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     report_date TEXT NOT NULL,
@@ -116,6 +126,10 @@ class Store:
                 );
                 """
             )
+            try:
+                db.execute("ALTER TABLE historical_operation_analyses ADD COLUMN prompt_text TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
 
     @staticmethod
     def now() -> str:
@@ -137,10 +151,64 @@ class Store:
             )
             return int(cursor.lastrowid)
 
+    def add_imported_sensor(self, recorded_at: str, payload: dict[str, Any]) -> bool:
+        """Store an Excel archive row without allowing it to affect live control."""
+        source = "imported:excel"
+        with self.connect() as db:
+            existing = db.execute(
+                "SELECT 1 FROM sensor_readings WHERE recorded_at = ? LIMIT 1",
+                (recorded_at,),
+            ).fetchone()
+            if existing:
+                return False
+            fields = (
+                payload.get("air_temp"), payload.get("humidity"), payload.get("co2"),
+                payload.get("scd40_temp"), payload.get("scd40_humidity"),
+                payload.get("ec"), payload.get("ph"), payload.get("solution_temp"),
+            )
+            db.execute(
+                """INSERT INTO sensor_readings (
+                    recorded_at, air_temp, humidity, co2, scd40_temp,
+                    scd40_humidity, ec, ph, solution_temp, source, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (recorded_at, *fields, source, json.dumps(payload, ensure_ascii=False)),
+            )
+            return True
+
+    def add_historical_operation_analysis(
+        self, title: str, prompt_text: str, input_text: str, model: str, result: dict[str, Any],
+    ) -> int:
+        with self.connect() as db:
+            cursor = db.execute(
+                """INSERT INTO historical_operation_analyses
+                   (created_at, title, prompt_text, input_text, model, result_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (self.now(), title, prompt_text, input_text, model, json.dumps(result, ensure_ascii=False)),
+            )
+            return int(cursor.lastrowid)
+
+    def historical_operation_analyses(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT id, created_at, title, model, result_json
+                   FROM historical_operation_analyses
+                   ORDER BY id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["result"] = json.loads(item.pop("result_json"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["result"] = {"headline": "저장된 분석 결과를 읽을 수 없습니다."}
+            result.append(item)
+        return result
+
     def latest_sensor(self) -> dict[str, Any] | None:
         with self.connect() as db:
             row = db.execute(
-                "SELECT * FROM sensor_readings ORDER BY id DESC LIMIT 1"
+                "SELECT * FROM sensor_readings WHERE source != 'imported:excel' ORDER BY id DESC LIMIT 1"
             ).fetchone()
         return dict(row) if row else None
 
@@ -198,7 +266,7 @@ class Store:
         if has_simulation:
             return "모의 데이터(비실측)"
         if has_measured:
-            return "서버 실측"
+            return "RS485 실측 (Pico 2 W)"
         return "출처 확인 필요"
 
     def add_recommendation(self, item: dict[str, Any]) -> int:
@@ -283,6 +351,27 @@ class Store:
                 (report_date,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def nearest_sensor_reading(
+        self, target: datetime, *, direction: str, maximum_offset_seconds: int = 180,
+    ) -> dict[str, Any] | None:
+        """Return the closest non-imported measured row immediately before or after target."""
+        if direction not in {"before", "after"}:
+            raise ValueError("direction must be before or after")
+        target_text = target.isoformat(timespec="seconds")
+        boundary = (target - timedelta(seconds=maximum_offset_seconds) if direction == "before"
+                    else target + timedelta(seconds=maximum_offset_seconds)).isoformat(timespec="seconds")
+        comparator, order = (">= ? AND recorded_at <= ?", "DESC") if direction == "before" else (">= ? AND recorded_at <= ?", "ASC")
+        values = (boundary, target_text) if direction == "before" else (target_text, boundary)
+        with self.connect() as db:
+            row = db.execute(
+                f"""SELECT recorded_at, air_temp, humidity, co2, ec, ph, solution_temp, source
+                    FROM sensor_readings
+                    WHERE source != 'imported:excel' AND recorded_at {comparator}
+                    ORDER BY recorded_at {order} LIMIT 1""",
+                values,
+            ).fetchone()
+        return dict(row) if row else None
 
     def add_capture(self, camera_id: str, path: str | None, status: str, error: str | None) -> int:
         with self.connect() as db:
