@@ -17,6 +17,11 @@ logs/
 data/
 captures/
 
+# 개인용 분석 묶음에는 실제 인증정보·DB·촬영본이 들어갈 수 있음
+smartfarm_logic_analysis_bundle/
+smartfarm_logic_analysis_bundle.zip
+tmp/
+
 # 편집기 및 운영체제 파일
 .vscode/
 .idea/

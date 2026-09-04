@@ -5,7 +5,7 @@ Pico 2 smart farm hardware pin settings.
 펌프/릴레이 출력 핀은 실제 단독 시험 전까지 이 파일에 정의하지 않는다.
 """
 
-# RS485 / PmodRS485 Rev.B / PE350
+# RS485 / PmodRS485 Rev.B shared Modbus RTU bus
 UART_ID = 0
 RS485_BAUD_RATE = 9600
 RS485_BITS = 8
@@ -17,12 +17,15 @@ UART_RX_PIN = 1
 RS485_DE_PIN = 2
 RS485_RE_PIN = 3
 
-# I2C1 shared bus: SCD40 and AHT10
-I2C_ID = 1
-I2C_SDA_PIN = 14
-I2C_SCL_PIN = 15
-SCD40_I2C_ADDRESS = 0x62
-AHT10_I2C_ADDRESS = 0x38
+# RS485 environmental sensors (all I2C sensors were removed from this farm).
+SHTC3_SLAVE_ID = 1
+SHTC3_BAUD_RATE = 9600
+SHTC3_HUMIDITY_REGISTER = 0x0000
+SHTC3_TEMPERATURE_REGISTER = 0x0001
+
+KCD_HP100_CO2_SLAVE_ID = 31
+KCD_HP100_CO2_BAUD_RATE = 38400
+KCD_HP100_CO2_REGISTER = 0x0004
 
 # DC relay control signals (GPIO number, not Pico physical pin number)
 # Relay module input specifications and active HIGH/LOW are not defined yet.
@@ -35,7 +38,7 @@ RELAY_S6_PH_PUMP_PIN = 21      # Pico physical pin 27
 RELAY_S7_FAN_PIN = 22          # Pico physical pin 29
 
 # PE350 / PE300 compatible Modbus RTU settings
-PE350_SLAVE_ID = 31
+PE350_SLAVE_ID = 21
 PE350_EC_REGISTER = 0x0001
 PE350_PH_REGISTER = 0x0002
 PE350_TEMPERATURE_REGISTER = 0x0003
