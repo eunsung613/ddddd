@@ -223,6 +223,11 @@ class TelegramSettingsRequest(BaseModel):
     allow_group_members: bool = False
 
 
+class GrowthScoreOverrideRequest(BaseModel):
+    score: int = Field(ge=0, le=100)
+    reason: str = Field(min_length=2, max_length=300)
+
+
 def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -> None:
     username = os.getenv("DASHBOARD_USERNAME")
     password = os.getenv("DASHBOARD_PASSWORD")
@@ -1134,6 +1139,7 @@ def latest_with_health() -> dict[str, Any]:
         "pe350_error": sensor_errors.get("pe350"),
     }
     response["growth_score"] = management_growth_score(response)
+    response["growth_score_override"] = growth_score_override()
     return response
 
 
@@ -1375,6 +1381,31 @@ def management_growth_score(
             "summary": telegram_public_text(analysis.get("summary"), "오늘 사진 기반 관찰 기록이 없습니다."),
             "confidence": analysis.get("confidence") or "미입력",
         },
+    }
+
+
+def growth_score_override() -> dict[str, Any]:
+    """Return an explicitly-labelled display override without touching sensor evidence.
+
+    This exists for short-term operator annotation after a known measurement
+    disturbance.  It is intentionally separate from the computed score so
+    automation, Telegram recommendations and reports keep using raw evidence.
+    """
+    raw_score = store.setting("growth_score_override_score")
+    if raw_score is None:
+        return {"active": False}
+    try:
+        score = int(raw_score)
+    except (TypeError, ValueError):
+        return {"active": False}
+    if not 0 <= score <= 100:
+        return {"active": False}
+    return {
+        "active": True,
+        "score": score,
+        "reason": store.setting("growth_score_override_reason", "운영자 보정") or "운영자 보정",
+        "updated_at": store.setting("growth_score_override_updated_at"),
+        "scope": "dashboard_display_only",
     }
 
 
@@ -3190,6 +3221,40 @@ def save_led_schedule(request: LedScheduleRequest) -> dict[str, Any]:
 @app.get("/api/sensors/latest", dependencies=[Depends(require_auth)])
 def latest_sensors() -> dict[str, Any]:
     return latest_with_health()
+
+
+@app.get("/api/settings/growth-score-override", dependencies=[Depends(require_auth)])
+def get_growth_score_override() -> dict[str, Any]:
+    return growth_score_override()
+
+
+@app.put(
+    "/api/settings/growth-score-override",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def save_growth_score_override(request: GrowthScoreOverrideRequest) -> dict[str, Any]:
+    now = datetime.now(SEOUL).isoformat(timespec="seconds")
+    store.set_settings({
+        "growth_score_override_score": str(request.score),
+        "growth_score_override_reason": request.reason.strip(),
+        "growth_score_override_updated_at": now,
+    })
+    store.workflow("growth_score_override", "saved", f"dashboard display score {request.score}/100 · {request.reason.strip()}")
+    return growth_score_override()
+
+
+@app.delete(
+    "/api/settings/growth-score-override",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def clear_growth_score_override() -> dict[str, Any]:
+    store.set_settings({
+        "growth_score_override_score": "",
+        "growth_score_override_reason": "",
+        "growth_score_override_updated_at": "",
+    })
+    store.workflow("growth_score_override", "cleared", "dashboard display score reverted to computed sensor score")
+    return growth_score_override()
 
 
 @app.get("/api/sensors/history", dependencies=[Depends(require_auth)])
