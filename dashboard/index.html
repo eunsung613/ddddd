@@ -45,7 +45,7 @@
     @media(max-width:760px){.app{display:block}.sidebar{display:none}.topbar{height:64px;padding:0 16px}.content{padding:20px 14px 88px}.clock{display:none}.page-head{align-items:flex-start}.page-head h1{font-size:21px}.kpis,.two,.three,.workflow-stats,.hero,.ai-layout{grid-template-columns:1fr 1fr}.mobile-nav{position:fixed;right:9px;bottom:9px;left:9px;z-index:20;display:grid;grid-template-columns:repeat(6,1fr);padding:6px;border:1px solid var(--line);border-radius:15px;background:rgba(255,255,255,.94);box-shadow:0 14px 45px rgba(30,51,80,.16);backdrop-filter:blur(16px)}.mobile-nav button{padding:8px 1px;border:0;border-radius:9px;background:transparent;color:#7b8799;font-size:8px;font-weight:700}.mobile-nav button.on{background:var(--blue-2);color:var(--blue)}}
     @media(max-width:520px){.preview-chip{max-width:145px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.page-head{display:grid;gap:12px}.page-head .actions{justify-self:start}.kpis,.two,.three,.workflow-stats,.hero,.ai-layout,.field-row{grid-template-columns:1fr}.hero-score{display:grid;justify-items:start}.camera{min-height:280px}.workflow-card p{min-height:0}.top-actions .avatar{display:none}}
   </style>
-  <link rel="stylesheet" href="/assets/app.css?v=graph-presentation-edit-1">
+  <link rel="stylesheet" href="/assets/app.css?v=bone-brand-1">
 </head>
 <body>
 <svg aria-hidden="true" width="0" height="0" style="position:absolute;overflow:hidden">
@@ -166,6 +166,6 @@
   function tick(){const now=new Date();$('clock').textContent=now.toLocaleTimeString('ko-KR',{hour12:false})}
   window.addEventListener('resize',()=>requestAnimationFrame(drawCharts));updateScoreMood();tick();setInterval(tick,1000);drawCharts();
 </script>
-<script src="/assets/app.js?v=graph-presentation-edit-1"></script>
+<script src="/assets/app.js?v=bone-brand-1"></script>
 </body>
 </html>
