@@ -2527,8 +2527,9 @@ def run_analysis() -> dict[str, Any]:
         result = stabilize_growth_stage(result, previous_row, len(previous_captures))
         analysis_id = store.add_analysis(result)
         recommendation_ids = create_rule_recommendations(latest, result)
+        stage_change = publish_confirmed_stage_transition({"id": analysis_id, **result})
         store.workflow("ai_analysis", "degraded" if degraded_error else "success", f"analysis={analysis_id}; {degraded_error or 'OpenAI success'}")
-        return {"id": analysis_id, "recommendation_ids": recommendation_ids, **result}
+        return {"id": analysis_id, "recommendation_ids": recommendation_ids, "stage_change": stage_change, **result}
     except Exception as error:
         store.workflow("ai_analysis", "failed", str(error))
         raise
@@ -2596,6 +2597,8 @@ def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], cap
         "[관리 환경]\n"
         f"점수  | {icon} {score_value} / 100 · {score['status']}\n"
         f"기준  | {stage} · EC 목표 {profile['ec_target']:.1f} · pH 목표 {profile['ph_target']:.1f}\n"
+        f"단계  | {stage} · {analysis.get('growth_stage_transition', '유지')}\n"
+        f"근거  | {telegram_public_text(analysis.get('growth_stage_reason'), '사진 근거 기록 없음')}\n"
         f"실측  | EC {latest.get('ec', '--')} dS/m · pH {latest.get('ph', '--')}\n"
         f"      | {latest.get('air_temp', '--')}℃ · 습도 {latest.get('humidity', '--')}% · CO₂ {latest.get('co2', '--')} ppm\n"
         f"{TELEGRAM_DIVIDER}\n"
@@ -2605,6 +2608,50 @@ def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], cap
         f"{TELEGRAM_DIVIDER}\n"
         f"📷 {'사진 첨부' if capture_available else '사진 미입력'} · 전체 근거는 첨부 PDF에서 확인{warning}"
     )
+
+
+def publish_confirmed_stage_transition(analysis: dict[str, Any]) -> dict[str, Any] | None:
+    """Publish a confirmed AI stage change without sending a relay command."""
+    if str(analysis.get("growth_stage_transition") or "") != "변경 확정":
+        return None
+    analysis_id = int(analysis.get("id") or 0)
+    if not analysis_id:
+        return None
+    dedupe_key = "stage_change_published:" + str(analysis_id)
+    if store.setting(dedupe_key):
+        return {"status": "already_published"}
+    stage, profile = growth_stage_profile(analysis)
+    message = (
+        "🥦 생육 단계 변경 확정\n"
+        f"{TELEGRAM_DIVIDER}\n"
+        f"새 단계 | {stage}\n"
+        f"AI 신뢰도 | {analysis.get('growth_stage_confidence', '낮음')}\n"
+        f"사진 근거 | {telegram_public_text(analysis.get('growth_stage_reason'), '근거 기록 없음')}\n"
+        f"전일 비교 | {telegram_public_text(analysis.get('growth_stage_comparison'), '비교 기록 없음')}\n"
+        f"{TELEGRAM_DIVIDER}\n"
+        "[새 관리 기준]\n"
+        f"EC {profile['ec_low']:.1f}~{profile['ec_high']:.1f} (목표 {profile['ec_target']:.1f})\n"
+        f"pH {profile['ph_low']:.1f}~{profile['ph_high']:.1f} (목표 {profile['ph_target']:.1f})\n"
+        f"기온 {profile['temp_low']:.0f}~{profile['temp_high']:.0f}℃ · 습도 {profile['humidity_low']:.0f}~{profile['humidity_high']:.0f}%\n"
+        "변경된 기준은 점수·환경 제안에 반영됩니다. 릴레이는 별도 사람 승인 없이는 동작하지 않습니다."
+    )
+    telegram_status = "not_configured"
+    try:
+        if telegram_config()["configured"]:
+            telegram_send_message(message)
+            telegram_status = "sent"
+    except Exception as error:
+        telegram_status = "failed"
+        store.workflow("stage_change_telegram", "failed", f"analysis={analysis_id}; {type(error).__name__}: {str(error)[:180]}")
+    try:
+        report = create_report(send_telegram=True, report_kind="stage_change")
+        report_id = report.get("id")
+    except Exception as error:
+        report_id = None
+        store.workflow("stage_change_report", "failed", f"analysis={analysis_id}; {type(error).__name__}: {str(error)[:180]}")
+    store.set_settings({dedupe_key: datetime.now(SEOUL).isoformat(timespec="seconds")})
+    store.workflow("stage_change", "published", f"analysis={analysis_id}; stage={stage}; telegram={telegram_status}; report={report_id}")
+    return {"status": "published", "telegram": telegram_status, "report_id": report_id}
 
 
 def telegram_approval_keyboard(recommendation_ids: list[int]) -> dict[str, Any] | None:
@@ -2907,7 +2954,7 @@ def build_intervention_effect_cards(events: list[dict[str, Any]]) -> list[dict[s
     return cards
 
 
-def create_report(report_date: str | None = None, send_telegram: bool = False) -> dict[str, Any]:
+def create_report(report_date: str | None = None, send_telegram: bool = False, report_kind: str = "daily") -> dict[str, Any]:
     report_date = report_date or date.today().isoformat()
     stats = store.day_stats(report_date)
     data_source = store.day_source_label(report_date)
@@ -2921,18 +2968,22 @@ def create_report(report_date: str | None = None, send_telegram: bool = False) -
     intervention_effects = build_intervention_effect_cards(actuator_events)
     latest = latest_with_health()
     growth_score = management_growth_score(latest, analysis, report_date)
-    output = REPORT_DIR / f"broccoli_daily_{report_date}.pdf"
+    if report_kind == "stage_change":
+        output = REPORT_DIR / f"broccoli_stage_change_{datetime.now(SEOUL).strftime('%Y%m%d_%H%M%S')}.pdf"
+    else:
+        output = REPORT_DIR / f"broccoli_daily_{report_date}.pdf"
     generate_daily_pdf(
         output, report_date, stats, analysis, captures, model, data_source, BASE_DIR,
         actuator_events=actuator_events, intervention_effects=intervention_effects,
         growth_stage=growth_stage, management_profile=management_profile, growth_score=growth_score,
     )
-    telegram_status = telegram_send_report(output, f"{report_date} 브로콜리 AI 일일 생육관찰 보고서") if send_telegram else "not_requested"
+    report_label = "생육 단계 변경 보고서" if report_kind == "stage_change" else "AI 일일 생육관찰 보고서"
+    telegram_status = telegram_send_report(output, f"{report_date} 브로콜리 {report_label}") if send_telegram else "not_requested"
     report_id = store.add_report({
         "report_date": report_date, "path": str(output), "model": model,
-        "status": "created", "telegram_status": telegram_status,
+        "status": "stage_change" if report_kind == "stage_change" else "created", "telegram_status": telegram_status,
     })
-    store.workflow("daily_report", "success", f"report={report_id}; actuator_events={len(actuator_events)}")
+    store.workflow("stage_change_report" if report_kind == "stage_change" else "daily_report", "success", f"report={report_id}; actuator_events={len(actuator_events)}")
     return {
         "id": report_id, "report_date": report_date, "model": model,
         "telegram_status": telegram_status, "actuator_event_count": len(actuator_events),

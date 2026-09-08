@@ -171,6 +171,10 @@ def generate_daily_pdf(
         confidence = analysis.get("result", analysis).get("confidence", "낮음")
     else:
         overall, summary, confidence = "판단 불가", "당일 AI 분석 기록이 없습니다.", "낮음"
+    stage_result = analysis.get("result", analysis) if analysis else {}
+    stage_transition = str(stage_result.get("growth_stage_transition") or "비교 대상 없음")
+    stage_reason = report_text(stage_result.get("growth_stage_reason"), "사진 기반 단계 판단 근거가 기록되지 않았습니다.")
+    stage_comparison = report_text(stage_result.get("growth_stage_comparison"), "전일 비교 기록이 없습니다.")
     profile = management_profile or {
         "ec_low": 1.0, "ec_target": 1.3, "ec_high": 1.5,
         "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.2,
@@ -184,7 +188,9 @@ def generate_daily_pdf(
     story.append(Table(
         [
             ["관리 환경 점수", score_text], ["점수 근거", Paragraph(score_reasons, normal)],
-            ["종합 상태", overall], ["생육 단계", growth_stage], ["분석 요약", Paragraph(summary, normal)], ["확신도", confidence],
+            ["종합 상태", overall], ["생육 단계", growth_stage], ["단계 변경", stage_transition],
+            ["단계 판단 근거", Paragraph(stage_reason, normal)], ["전일 사진 비교", Paragraph(stage_comparison, normal)],
+            ["분석 요약", Paragraph(summary, normal)], ["확신도", confidence],
         ],
         colWidths=[30 * mm, 146 * mm],
         style=TableStyle([
