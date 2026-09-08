@@ -2712,6 +2712,36 @@ def recommendation_is_fresh(item: dict[str, Any]) -> bool:
         return False
 
 
+def deterministic_rule_still_active(item: dict[str, Any], latest: dict[str, Any]) -> bool:
+    """Check current values before permitting an old environmental-rule button."""
+    evidence = dict(item.get("evidence") or {})
+    rule_key = str(evidence.get("rule_key") or "")
+    if rule_key == "air_temp_high":
+        return latest.get("air_temp") is not None and float(latest["air_temp"]) > float(evidence.get("threshold", 25.0))
+    if rule_key == "humidity_high":
+        return latest.get("humidity") is not None and float(latest["humidity"]) > float(evidence.get("threshold", 80.0))
+    return False
+
+
+def refresh_expired_nutrient_approval(item: dict[str, Any]) -> list[int]:
+    """Replace an old nutrient button with a fresh, current-measurement request.
+
+    The old button never doses chemicals.  A new button is only issued while
+    the same current rule condition remains true, and it retains the normal
+    human approval and PE350 safety checks.
+    """
+    latest = latest_with_health()
+    evidence = dict(item.get("evidence") or {})
+    key, _ = rule_episode_identity(item)
+    store.set_settings({
+        "rule_episode:" + key: "",
+        "rule_alert:" + str(item.get("title") or ""): "",
+    })
+    analysis_row = (store.analyses(1) or [None])[0]
+    analysis = dict((analysis_row or {}).get("result") or {})
+    return create_rule_recommendations(latest, analysis)
+
+
 def process_telegram_callback(callback: dict[str, Any]) -> None:
     config = telegram_config()
     callback_id = str(callback.get("id", ""))
@@ -2738,15 +2768,44 @@ def process_telegram_callback(callback: dict[str, Any]) -> None:
         if item.get("status") != "pending":
             status = str(item.get("status") or "")
             if status == "superseded":
+                if item.get("source") == "nutrient_feedback_rule":
+                    new_ids = refresh_expired_nutrient_approval(item)
+                    if new_ids:
+                        telegram_send_approval_requests(new_ids, context="기존 만료 버튼을 현재 실측값으로 갱신")
+                        answer("현재 실측값 기준의 새 승인 요청을 보냈습니다. 새 버튼을 눌러주세요.")
+                        return
+                    raise ValueError("이전 제안은 만료됐고, 현재 실측값은 보정 조건이 아닙니다. 새 주입 요청은 만들지 않았습니다.")
                 raise ValueError("이 제안은 10분 유효시간이 지나 새 실측값 기준으로 교체됐어요. 가장 최근 승인 버튼을 눌러주세요.")
             if status == "approved":
                 raise ValueError("이 제안은 이미 승인되어 처리 중이거나 처리되었습니다. 같은 버튼을 다시 누를 필요가 없어요.")
             if status == "rejected":
                 raise ValueError("이 제안은 이미 거절되었습니다. 새 실측값이 필요하면 새 제안이 옵니다.")
             raise ValueError("이 제안은 더 이상 승인 대기 상태가 아닙니다. 최신 메시지의 버튼을 확인하세요.")
-        if not recommendation_is_fresh(item):
-            raise ValueError("이 제안의 10분 승인 유효시간이 지났습니다. 새 실측값 기준의 최신 버튼을 사용하세요.")
-        result = decide_recommendation(recommendation_id, decision, f"telegram:{user_id}", "Telegram inline approval")
+        expired = not recommendation_is_fresh(item)
+        if expired and decision == "approve" and item.get("source") == "nutrient_feedback_rule":
+            with recommendation_lock:
+                current = store.recommendation(recommendation_id)
+                if current and current.get("status") == "pending":
+                    store.decide_recommendation(recommendation_id, "superseded", "system", "승인 유효시간 경과: 현재 실측값 기반 요청으로 갱신")
+                    record_decision_event(current, recommendation_id, "superseded", "system", "승인 유효시간 경과: 현재 실측값 기반 요청으로 갱신")
+            new_ids = refresh_expired_nutrient_approval(item)
+            if new_ids:
+                telegram_send_approval_requests(new_ids, context="만료 버튼을 현재 실측값으로 갱신")
+                answer("현재 실측값 기준의 새 승인 요청을 보냈습니다. 새 버튼을 눌러주세요.")
+                return
+            raise ValueError("승인 유효시간이 지났고 현재 실측값은 보정 조건이 아닙니다. 안전상 주입 요청을 만들지 않았습니다.")
+        if expired and item.get("source") == "deterministic_rule":
+            if not deterministic_rule_still_active(item, latest_with_health()):
+                with recommendation_lock:
+                    current = store.recommendation(recommendation_id)
+                    if current and current.get("status") == "pending":
+                        store.decide_recommendation(recommendation_id, "superseded", "system", "승인 유효시간 경과 후 현재 환경 규칙이 해소됨")
+                        record_decision_event(current, recommendation_id, "superseded", "system", "승인 유효시간 경과 후 현재 환경 규칙이 해소됨")
+                raise ValueError("승인 유효시간이 지났고 현재 환경값은 정상입니다. 실행하지 않았습니다.")
+        approval_note = "Telegram inline approval"
+        if expired:
+            approval_note = "Telegram 만료 버튼 재확인 승인 · 현재 안전검사 후 실행"
+        result = decide_recommendation(recommendation_id, decision, f"telegram:{user_id}", approval_note)
         answer(f"{result['status']}: #{recommendation_id}")
         telegram_send_message(f"#{recommendation_id} {result['status']} · {result['note']}")
     except (HTTPException, PermissionError, TypeError, ValueError) as error:
