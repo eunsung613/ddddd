@@ -2684,20 +2684,29 @@ def telegram_send_approval_requests(recommendation_ids: list[int], *, context: s
             if not item or item.get("status") != "pending":
                 continue
             evidence = item.get("evidence") or {}
-            if item.get("source") == "nutrient_feedback_rule":
+            if item.get("source") in {"nutrient_feedback_rule", "operator_target_adjustment"}:
                 stage = evidence.get("growth_stage", DEFAULT_GROWTH_STAGE)
                 target = evidence.get("target", "관리 기준")
                 value = evidence.get("ec") if item.get("actuator") == "ec" else evidence.get("ph")
                 label = "EC" if item.get("actuator") == "ec" else "pH"
                 unit = " dS/m" if label == "EC" else ""
+                target_label = "적정 범위" if item.get("source") == "nutrient_feedback_rule" else "사용자 지정 목표"
                 details.append(
                     f"🌱 AI 판단: {stage} (신뢰도 {evidence.get('analysis_confidence', '낮음')})\n"
-                    f"🧪 현재 {label} {value}{unit} · 적정 범위 {target}\n"
+                    f"🧪 현재 {label} {value}{unit} · {target_label} {target}\n"
                     f"🔁 전일 비교: {telegram_public_text(evidence.get('growth_stage_comparison'), '전일 비교 근거를 확인해 주세요.')}\n"
                     f"💡 {item.get('rationale')}"
                 )
             else:
                 details.append(f"💡 {item.get('rationale') or item.get('title')}")
+        single_pulse_only = any(
+            (store.recommendation(recommendation_id) or {}).get("source") == "operator_target_adjustment"
+            for recommendation_id in recommendation_ids
+        )
+        completion_note = (
+            "승인 후: 산성액 5초 1회 → PE350 재측정 · 반복 자동주입 없음"
+            if single_pulse_only else "승인 후: 목표값까지 주입 → 교반 → 재측정 반복"
+        )
         telegram_send_message(
             "🥦 새 제어 제안\n"
             + f"{TELEGRAM_DIVIDER}\n"
@@ -2705,7 +2714,7 @@ def telegram_send_approval_requests(recommendation_ids: list[int], *, context: s
             + f"{TELEGRAM_DIVIDER}\n"
             + (f"\n{TELEGRAM_DIVIDER}\n".join(details))
             + f"\n{TELEGRAM_DIVIDER}\n"
-            + "승인 후: 목표값까지 주입 → 교반 → 재측정 반복\n"
+            + completion_note + "\n"
             + "중단: 언제든 /stop",
             keyboard,
         )
