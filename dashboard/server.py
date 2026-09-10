@@ -244,7 +244,13 @@ def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -
 
 def require_local_settings(request: Request) -> None:
     host = request.client.host if request.client else None
-    if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+    configured_clients = {
+        item.strip()
+        for item in os.getenv("SMARTFARM_LOCAL_SETTINGS_CLIENTS", "").split(",")
+        if item.strip()
+    }
+    allowed_clients = {"127.0.0.1", "::1", "localhost", "testclient"} | configured_clients
+    if host not in allowed_clients:
         raise HTTPException(403, "Settings can only be changed on the server laptop")
 
 
