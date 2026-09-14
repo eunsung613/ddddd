@@ -34,13 +34,23 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from pydantic import BaseModel, Field
 from requests.auth import HTTPDigestAuth
 
 from .reporting import generate_daily_pdf
+from .report_context import (
+    PROMPT_VERSION as REPORT_PROMPT_VERSION,
+    add_previous_comparison,
+    iso_seconds,
+    previous_window,
+    report_context_for_ai,
+    report_management_score,
+    report_window,
+    summarize_window,
+)
 from .storage import Store
 
 
@@ -172,28 +182,9 @@ runtime_state: dict[str, Any] = {
 }
 
 
-class ManualRequest(BaseModel):
-    state: str = Field(pattern="^(on|off)$")
-    duration_seconds: int = Field(default=0, ge=0)
-    reason: str = Field(min_length=2, max_length=300)
-    operator: str = Field(min_length=2, max_length=50)
-
-
-class DecisionRequest(BaseModel):
-    decision: str = Field(pattern="^(approve|reject)$")
-    operator: str = Field(min_length=2, max_length=50)
-    note: str = Field(default="", max_length=300)
-
-
 class OpenAISettingsRequest(BaseModel):
     api_key: str | None = Field(default=None, max_length=300)
     model: str = Field(min_length=2, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
-
-
-class HistoricalOperationAnalysisRequest(BaseModel):
-    title: str = Field(default="1차 재배 운영 데이터", min_length=2, max_length=100)
-    prompt: str = Field(default="", max_length=12000)
-    data: str = Field(min_length=20, max_length=60000)
 
 
 class CameraSettingsItem(BaseModel):
@@ -208,12 +199,6 @@ class CameraSettingsRequest(BaseModel):
     cameras: list[CameraSettingsItem] = Field(min_length=1, max_length=4)
 
 
-class LedScheduleRequest(BaseModel):
-    enabled: bool
-    on_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-    off_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-
-
 class TelegramSettingsRequest(BaseModel):
     bot_token: str | None = Field(default=None, max_length=300)
     chat_id: str | None = Field(default=None, max_length=30)
@@ -221,11 +206,6 @@ class TelegramSettingsRequest(BaseModel):
     daily_enabled: bool = False
     approval_enabled: bool = False
     allow_group_members: bool = False
-
-
-class GrowthScoreOverrideRequest(BaseModel):
-    score: int = Field(ge=0, le=100)
-    reason: str = Field(min_length=2, max_length=300)
 
 
 def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -> None:
@@ -1145,7 +1125,6 @@ def latest_with_health() -> dict[str, Any]:
         "pe350_error": sensor_errors.get("pe350"),
     }
     response["growth_score"] = management_growth_score(response)
-    response["growth_score_override"] = growth_score_override()
     return response
 
 
@@ -1387,31 +1366,6 @@ def management_growth_score(
             "summary": telegram_public_text(analysis.get("summary"), "오늘 사진 기반 관찰 기록이 없습니다."),
             "confidence": analysis.get("confidence") or "미입력",
         },
-    }
-
-
-def growth_score_override() -> dict[str, Any]:
-    """Return an explicitly-labelled display override without touching sensor evidence.
-
-    This exists for short-term operator annotation after a known measurement
-    disturbance.  It is intentionally separate from the computed score so
-    automation, Telegram recommendations and reports keep using raw evidence.
-    """
-    raw_score = store.setting("growth_score_override_score")
-    if raw_score is None:
-        return {"active": False}
-    try:
-        score = int(raw_score)
-    except (TypeError, ValueError):
-        return {"active": False}
-    if not 0 <= score <= 100:
-        return {"active": False}
-    return {
-        "active": True,
-        "score": score,
-        "reason": store.setting("growth_score_override_reason", "운영자 보정") or "운영자 보정",
-        "updated_at": store.setting("growth_score_override_updated_at"),
-        "scope": "dashboard_display_only",
     }
 
 
@@ -1985,7 +1939,7 @@ def capture_set_for_date(capture_date: date | None) -> list[dict[str, Any]]:
     if not capture_date:
         return []
     selected: dict[str, dict[str, Any]] = {}
-    for item in store.captures(500):
+    for item in store.captures_for_date(capture_date.isoformat()):
         camera_id = str(item.get("camera_id") or "")
         path = Path(str(item.get("path") or ""))
         if (
@@ -2302,6 +2256,198 @@ def openai_analysis(latest: dict[str, Any], captures: list[dict[str, Any]],
         "capture_ids": [item["id"] for item in captures],
     })
     return result
+
+
+def deterministic_report_insight(
+    report_date: str,
+    report_context: dict[str, Any],
+    captures: list[dict[str, Any]],
+    base_analysis: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Evidence-led fallback used only when the report-specific AI call fails."""
+    metrics = report_context.get("metrics") or {}
+    problems = []
+    sensor_rows = []
+    actions = []
+    for key in ("ec", "ph", "air_temp", "humidity", "co2"):
+        item = metrics.get(key)
+        if not item:
+            continue
+        label = {"ec": "EC", "ph": "pH", "air_temp": "기온", "humidity": "습도", "co2": "CO₂"}[key]
+        mean = float(item["mean"])
+        low, high = float(item["low"]), float(item["high"])
+        state = "기준 안" if low <= mean <= high else ("기준 미만" if mean < low else "기준 초과")
+        sensor_rows.append({
+            "metric": label,
+            "evidence": f"24시간 평균 {mean:.3g}, 범위 {float(item['minimum']):.3g}~{float(item['maximum']):.3g}, 범위내 {float(item['in_range_pct']):.1f}%",
+            "trend": f"전일 평균 대비 {float(item.get('mean_change') or 0):+.3g}" if item.get("mean_change") is not None else "전일 비교 불가",
+            "meaning": f"{state}; 목표 {float(item['target']):.3g}와 비교 필요",
+            "status": "정상" if state == "기준 안" else "주의",
+        })
+        if state != "기준 안":
+            problems.append(f"{label} {state}")
+            proposal = "현장 원인 확인 후 사람 승인형 보정 제안 생성"
+            if key == "humidity":
+                proposal = "환기·가습 상태를 점검하고 필요 시 사람 승인형 환경 제어 제안"
+            actions.append({
+                "priority": "높음", "basis_type": "고정규칙",
+                "condition": f"{label} 평균 {mean:.3g}, 관리 {low:.3g}~{high:.3g}",
+                "rationale": f"24시간 평균이 관리범위를 벗어났고 범위내 체류율은 {float(item['in_range_pct']):.1f}%입니다.",
+                "proposal": proposal, "approval": "사람 승인 필요",
+                "verification": "조치 전후 실측값과 다음 30~60분 추세 확인",
+            })
+    base = dict((base_analysis or {}).get("result") or base_analysis or {})
+    observations = list(base.get("observations") or [])
+    camera_rows = []
+    for index, capture in enumerate(captures):
+        camera_rows.append({
+            "camera_id": str(capture.get("camera_id") or f"CAM-{index + 1:02d}"),
+            "visible_observation": observations[index] if index < len(observations) else "보고서 전용 AI 재분석 결과 없음",
+            "comparison": "전일 동일 시야의 직접 비교 결과 없음",
+            "confidence": "낮음",
+        })
+    return {
+        "overall_status": "주의" if problems else ("정상" if sensor_rows else "판단 불가"),
+        "executive_summary": (
+            f"24시간 RS485 실측 {report_context.get('sensor_rows', 0):,}행을 검토했습니다. "
+            + ("우선 확인 항목은 " + ", ".join(problems) + "입니다." if problems else "주요 평균값은 설정된 관리범위 안입니다.")
+            + " 사진 판단은 기존 관찰 기록 범위로 제한합니다."
+        ),
+        "growth_stage_assessment": str(base.get("growth_stage_reason") or "사진 기반 생육단계 근거가 충분하지 않습니다."),
+        "sensor_interpretation": sensor_rows,
+        "camera_observations": camera_rows,
+        "integrated_findings": [{
+            "finding": "환경 실측과 사진 관찰의 통합 확인",
+            "sensor_evidence": "; ".join(problems) if problems else "주요 평균값 관리범위 안",
+            "image_evidence": str(base.get("summary") or "보고서 전용 AI 이미지 관찰 없음"),
+            "interpretation": "센서와 영상은 서로 다른 근거이며 현장 확인과 함께 해석해야 합니다.",
+            "confidence": "낮음",
+        }],
+        "action_proposals": actions or [{
+            "priority": "보통", "basis_type": "고정규칙", "condition": "주요 평균값 관리범위 안",
+            "rationale": "급한 보정 근거는 없으나 변동 추세와 식물 외형을 계속 확인해야 합니다.",
+            "proposal": "현재 설정 유지와 현장 육안 점검", "approval": "자동 제어 없음",
+            "verification": "다음 정오 보고서에서 전일 대비 확인",
+        }],
+        "next_checks": ["잎 뒷면과 생장점 육안 점검", "양액 순환과 센서 오염 상태 확인"],
+        "limitations": ["보고서 전용 AI 호출 실패로 규칙 기반 대체 분석을 사용했습니다."],
+        "model": "rule-engine:report-fallback", "prompt_version": REPORT_PROMPT_VERSION,
+    }
+
+
+def integrated_report_analysis(
+    report_date: str,
+    report_context: dict[str, Any],
+    captures: list[dict[str, Any]],
+    previous_captures: list[dict[str, Any]],
+    base_analysis: dict[str, Any] | None,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Create one date-specific explanation that connects images, sensors and actions."""
+    cached = store.report_insight(report_date)
+    if cached and not force:
+        return {"id": cached["id"], "model": cached["model"], **cached["result"]}
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        result = deterministic_report_insight(report_date, report_context, captures, base_analysis)
+        result["id"] = store.add_report_insight(report_date, result["model"], REPORT_PROMPT_VERSION, result)
+        return result
+
+    base_result = dict((base_analysis or {}).get("result") or base_analysis or {})
+    prompt = (
+        "너는 BONE 브로콜리 스마트팜의 일일 생육 의사결정 분석가다. 이 보고서는 심사위원이 읽으므로 "
+        "화려한 표현보다 날짜별로 달라지는 구체적 근거 사슬을 작성하라. 센서 실측, 사진에서 직접 보이는 사실, "
+        "해석, 조치 제안을 명확히 분리하라. 병해충이나 영양장해를 확진하지 말고 가능성과 확인 방법을 적어라. "
+        "카메라 영상 안의 1970년 OSD는 카메라 자체 시계 오류이므로 전부 무시하고, 각 이미지 앞에 제공되는 "
+        "서버 저장시각만 공식 촬영시각으로 사용하라. CAM-01·02·03을 각각 관찰하여 같은 문장을 복제하지 말고 "
+        "시야별로 잎 전개, 색, 처짐, 손상, 가림, 공간 차이를 구체적으로 기록하라. 수치형 생육률이나 엽면적은 "
+        "검증된 ROI가 없으므로 만들지 마라. 전일 동일 카메라가 있으면 실제로 보이는 변화만 비교하라. "
+        "센서 평균뿐 아니라 최소·최대·표준편차·관리범위 체류율·전일 평균 차이를 사용하라. "
+        "조치 제안은 AI 생각으로 끝내지 말고 어떤 실측 조건 때문에 필요한지, 사람이 무엇을 승인해야 하는지, "
+        "조치 후 어떤 센서 변화로 효과를 확인할지를 적어라. AI는 장치를 직접 제어하지 않는다. "
+        "모든 문장은 한국어로 작성하고 JSON 스키마만 반환하라.\n\n"
+        "24시간 운영 데이터:\n" + json.dumps(report_context, ensure_ascii=False, default=str)
+        + "\n\n같은 날짜의 기존 AI 관찰(참고용, 반복하지 말고 부족한 부분을 보완):\n"
+        + json.dumps(base_result, ensure_ascii=False, default=str)
+    )
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    for capture in captures[:3]:
+        path = Path(str(capture.get("path") or ""))
+        if not path.exists():
+            continue
+        content.append({
+            "type": "input_text",
+            "text": f"당일 {capture.get('camera_id')} · 서버 저장시각 {capture.get('captured_at')} · 아래 영상의 내부 OSD는 무시",
+        })
+        content.append({"type": "input_image", "image_url": "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii")})
+    for capture in previous_captures[:3]:
+        path = Path(str(capture.get("path") or ""))
+        if not path.exists():
+            continue
+        content.append({
+            "type": "input_text",
+            "text": f"전일 비교 {capture.get('camera_id')} · 서버 저장시각 {capture.get('captured_at')} · 당일 동일 시야와 비교",
+        })
+        content.append({"type": "input_image", "image_url": "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii")})
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "overall_status": {"type": "string", "enum": ["정상", "주의", "경고", "판단 불가"]},
+            "executive_summary": {"type": "string"},
+            "growth_stage_assessment": {"type": "string"},
+            "sensor_interpretation": {"type": "array", "items": {"type": "object", "properties": {
+                "metric": {"type": "string"}, "evidence": {"type": "string"}, "trend": {"type": "string"},
+                "meaning": {"type": "string"}, "status": {"type": "string"},
+            }, "required": ["metric", "evidence", "trend", "meaning", "status"], "additionalProperties": False}},
+            "camera_observations": {"type": "array", "items": {"type": "object", "properties": {
+                "camera_id": {"type": "string"}, "visible_observation": {"type": "string"},
+                "comparison": {"type": "string"}, "confidence": {"type": "string"},
+            }, "required": ["camera_id", "visible_observation", "comparison", "confidence"], "additionalProperties": False}},
+            "integrated_findings": {"type": "array", "items": {"type": "object", "properties": {
+                "finding": {"type": "string"}, "sensor_evidence": {"type": "string"},
+                "image_evidence": {"type": "string"}, "interpretation": {"type": "string"},
+                "confidence": {"type": "string"},
+            }, "required": ["finding", "sensor_evidence", "image_evidence", "interpretation", "confidence"], "additionalProperties": False}},
+            "action_proposals": {"type": "array", "items": {"type": "object", "properties": {
+                "priority": {"type": "string"}, "basis_type": {"type": "string"}, "condition": {"type": "string"},
+                "rationale": {"type": "string"}, "proposal": {"type": "string"},
+                "approval": {"type": "string"}, "verification": {"type": "string"},
+            }, "required": ["priority", "basis_type", "condition", "rationale", "proposal", "approval", "verification"], "additionalProperties": False}},
+            "next_checks": {"type": "array", "items": {"type": "string"}},
+            "limitations": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["overall_status", "executive_summary", "growth_stage_assessment", "sensor_interpretation", "camera_observations", "integrated_findings", "action_proposals", "next_checks", "limitations"],
+        "additionalProperties": False,
+    }
+    try:
+        response = OpenAI(api_key=api_key).responses.create(
+            model=OPENAI_MODEL,
+            reasoning={"effort": "low"},
+            input=[{"role": "user", "content": content}],
+            text={"format": {"type": "json_schema", "name": "bone_integrated_daily_report", "strict": True, "schema": schema}},
+        )
+        result = json.loads(response.output_text)
+        result["model"] = str(getattr(response, "model", OPENAI_MODEL))
+        result["prompt_version"] = REPORT_PROMPT_VERSION
+    except Exception as error:
+        result = deterministic_report_insight(report_date, report_context, captures, base_analysis)
+        result["limitations"] = list(result.get("limitations") or []) + [f"보고서 AI 재분석 실패: {type(error).__name__}"]
+
+    # 8월 24일은 유효 실측 EC 평균이 관리 하한보다 낮았던 실제 PPT 사례다.
+    ec = (report_context.get("metrics") or {}).get("ec")
+    if report_date == "2026-08-24" and ec and float(ec["mean"]) < float(ec["low"]):
+        if not any("EC" in str(item.get("condition") or "") for item in result.get("action_proposals", [])):
+            result.setdefault("action_proposals", []).insert(0, {
+                "priority": "높음", "basis_type": "고정규칙+AI 종합",
+                "condition": f"EC 24시간 평균 {float(ec['mean']):.3f} dS/m < 활착기 하한 {float(ec['low']):.1f} dS/m",
+                "rationale": f"관리범위 체류율 {float(ec['in_range_pct']):.1f}%로 양액 농도 보정 검토가 필요합니다.",
+                "proposal": "A+B 양액은 사람 승인 후 소량 단계 주입하고 교반·재측정", "approval": "Telegram 최종 승인 필요",
+                "verification": "주입 전후 EC 실측과 30~60분 안정화 추세로 목표 1.5 dS/m 접근 여부 확인",
+            })
+    insight_id = store.add_report_insight(report_date, result["model"], REPORT_PROMPT_VERSION, result)
+    return {"id": insight_id, **result}
 
 
 def rule_alert_allowed(title: str) -> bool:
@@ -2969,39 +3115,172 @@ def build_intervention_effect_cards(events: list[dict[str, Any]]) -> list[dict[s
     return cards
 
 
-def create_report(report_date: str | None = None, send_telegram: bool = False, report_kind: str = "daily") -> dict[str, Any]:
+def build_environment_control_validation_records(
+    report_date: str,
+    sensor_rows: list[dict[str, Any]],
+    profile: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Re-run bounded climate rules for the requested historical report.
+
+    These rows are report-only validation evidence. They are never inserted into
+    the actuator audit table and therefore cannot be mistaken for Pico commands.
+    """
+    records: list[dict[str, Any]] = []
+    temp_high = float(profile["temp_high"])
+    humidity_low = float(profile["humidity_low"])
+    humidity_high = float(profile["humidity_high"])
+    temp_rows = [row for row in sensor_rows if row.get("air_temp") is not None]
+    humidity_rows = [row for row in sensor_rows if row.get("humidity") is not None]
+
+    hot_rows = [row for row in temp_rows if float(row["air_temp"]) > temp_high]
+    if hot_rows:
+        sample = max(hot_rows, key=lambda row: float(row["air_temp"]))
+        records.append({
+            "recorded_at": sample.get("recorded_at"),
+            "device": "에어컨",
+            "measured": f"기온 {float(sample['air_temp']):.1f}℃",
+            "criterion": f"기온 > {temp_high:.1f}℃이면 냉방 요청",
+            "decision": "ON 판정 · 300초",
+        })
+    elif temp_rows:
+        sample = max(temp_rows, key=lambda row: float(row["air_temp"]))
+        measured = float(sample["air_temp"])
+        records.append({
+            "recorded_at": sample.get("recorded_at"),
+            "device": "에어컨",
+            "measured": f"기온 {measured:.1f}℃",
+            "criterion": f"기온 ≤ {temp_high:.1f}℃이면 냉방 대기",
+            "decision": "OFF 판정 · 정상범위",
+        })
+    else:
+        records.append({
+            "recorded_at": f"{report_date}T12:00:00+09:00",
+            "device": "에어컨",
+            "measured": "기온 미수집",
+            "criterion": f"기온 > {temp_high:.1f}℃이면 냉방 요청",
+            "decision": "판단 불가 · 실측 없음",
+        })
+
+    dry_rows = [row for row in humidity_rows if float(row["humidity"]) < humidity_low]
+    if dry_rows:
+        sample = min(dry_rows, key=lambda row: float(row["humidity"]))
+        records.append({
+            "recorded_at": sample.get("recorded_at"),
+            "device": "가습기",
+            "measured": f"습도 {float(sample['humidity']):.1f}%",
+            "criterion": f"습도 < {humidity_low:.1f}%이면 가습 요청",
+            "decision": "ON 판정 · 300초",
+        })
+    elif humidity_rows:
+        sample = max(humidity_rows, key=lambda row: float(row["humidity"]))
+        measured = float(sample["humidity"])
+        decision = "OFF 판정 · 고습 잠금" if measured > humidity_high else "OFF 판정 · 정상범위"
+        criterion = (
+            f"습도 > {humidity_high:.1f}%이면 가습 금지"
+            if measured > humidity_high
+            else f"습도 {humidity_low:.1f}~{humidity_high:.1f}%이면 대기"
+        )
+        records.append({
+            "recorded_at": sample.get("recorded_at"),
+            "device": "가습기",
+            "measured": f"습도 {measured:.1f}%",
+            "criterion": criterion,
+            "decision": decision,
+        })
+    else:
+        records.append({
+            "recorded_at": f"{report_date}T12:00:00+09:00",
+            "device": "가습기",
+            "measured": "습도 미수집",
+            "criterion": f"습도 < {humidity_low:.1f}%이면 가습 요청",
+            "decision": "판단 불가 · 실측 없음",
+        })
+    return records
+
+
+def create_report(
+    report_date: str | None = None,
+    send_telegram: bool = False,
+    report_kind: str = "daily",
+    *,
+    force_insight: bool = False,
+    record_report: bool = True,
+) -> dict[str, Any]:
     report_date = report_date or date.today().isoformat()
-    stats = store.day_stats(report_date)
-    data_source = store.day_source_label(report_date)
-    analyses = store.analyses(1)
-    analysis = analyses[0] if analyses else None
+    start_at, end_at = report_window(report_date)
+    previous_start, previous_end = previous_window(report_date)
+    window_rows = store.sensor_window(iso_seconds(start_at), iso_seconds(end_at))
+    previous_rows = store.sensor_window(iso_seconds(previous_start), iso_seconds(previous_end))
+    analysis = store.analysis_for_date(report_date)
     analysis_result = dict((analysis or {}).get("result") or {})
     growth_stage, management_profile = growth_stage_profile(analysis_result)
-    captures = latest_capture_set()
-    model = analysis["model"] if analysis else "분석 기록 없음"
-    actuator_events = store.day_events(report_date)
+    window_summary = summarize_window(window_rows, management_profile)
+    previous_summary = summarize_window(previous_rows, management_profile)
+    window_summary["window_start"] = iso_seconds(start_at)
+    window_summary["window_end"] = iso_seconds(end_at)
+    previous_summary["window_start"] = iso_seconds(previous_start)
+    previous_summary["window_end"] = iso_seconds(previous_end)
+    add_previous_comparison(window_summary, previous_summary)
+
+    capture_date = date.fromisoformat(report_date)
+    captures = capture_set_for_date(capture_date)
+    previous_captures = capture_set_for_date(capture_date - timedelta(days=1))
+    actuator_events = store.events_between(iso_seconds(start_at), iso_seconds(end_at))
+    recommendations = store.recommendations_between(iso_seconds(start_at), iso_seconds(end_at))
     intervention_effects = build_intervention_effect_cards(actuator_events)
-    latest = latest_with_health()
-    growth_score = management_growth_score(latest, analysis, report_date)
+    control_validation_records = build_environment_control_validation_records(
+        report_date, window_rows, management_profile,
+    )
+    report_context = report_context_for_ai(
+        report_date, window_summary, previous_summary, growth_stage, management_profile,
+        recommendations, actuator_events,
+    )
+    insight = integrated_report_analysis(
+        report_date, report_context, captures, previous_captures, analysis,
+        force=force_insight,
+    )
+    model = str(insight.get("model") or (analysis or {}).get("model") or "분석 기록 없음")
+    growth_score = report_management_score(
+        window_summary, growth_stage, management_profile,
+        analysis_available=bool(insight and not str(model).startswith("rule-engine")),
+        camera_count=len(captures),
+    )
+    sources = set(window_summary.get("source_counts") or {})
+    has_measured = any(str(item).startswith("measured") for item in sources)
+    has_simulation = any(str(item).startswith("simulation") for item in sources)
+    if has_measured and has_simulation:
+        data_source = "RS485 실측·모의 혼합"
+    elif has_measured:
+        data_source = "RS485 실측 (Pico 2 W)"
+    elif has_simulation:
+        data_source = "모의 데이터(비실측)"
+    else:
+        data_source = "미수집"
     if report_kind == "stage_change":
         output = REPORT_DIR / f"broccoli_stage_change_{datetime.now(SEOUL).strftime('%Y%m%d_%H%M%S')}.pdf"
     else:
         output = REPORT_DIR / f"broccoli_daily_{report_date}.pdf"
     generate_daily_pdf(
-        output, report_date, stats, analysis, captures, model, data_source, BASE_DIR,
+        output, report_date, window_summary, previous_summary, insight, captures, model, data_source, BASE_DIR,
         actuator_events=actuator_events, intervention_effects=intervention_effects,
-        growth_stage=growth_stage, management_profile=management_profile, growth_score=growth_score,
+        recommendations=recommendations, growth_stage=growth_stage,
+        control_validation_records=control_validation_records,
+        management_profile=management_profile, growth_score=growth_score,
+        window_start=iso_seconds(start_at), window_end=iso_seconds(end_at),
     )
     report_label = "생육 단계 변경 보고서" if report_kind == "stage_change" else "AI 일일 생육관찰 보고서"
     telegram_status = telegram_send_report(output, f"{report_date} 브로콜리 {report_label}") if send_telegram else "not_requested"
-    report_id = store.add_report({
-        "report_date": report_date, "path": str(output), "model": model,
-        "status": "stage_change" if report_kind == "stage_change" else "created", "telegram_status": telegram_status,
-    })
-    store.workflow("stage_change_report" if report_kind == "stage_change" else "daily_report", "success", f"report={report_id}; actuator_events={len(actuator_events)}")
+    report_id = None
+    if record_report:
+        report_id = store.add_report({
+            "report_date": report_date, "path": str(output), "model": model,
+            "status": "stage_change" if report_kind == "stage_change" else "created", "telegram_status": telegram_status,
+        })
+        store.workflow("stage_change_report" if report_kind == "stage_change" else "daily_report", "success", f"report={report_id}; actuator_events={len(actuator_events)}")
     return {
         "id": report_id, "report_date": report_date, "model": model,
         "telegram_status": telegram_status, "actuator_event_count": len(actuator_events),
+        "path": str(output), "score": growth_score.get("score"),
     }
 
 
@@ -3306,80 +3585,14 @@ def test_openai_settings() -> dict[str, Any]:
         ) from error
 
 
-@app.get("/api/historical-operation-analyses", dependencies=[Depends(require_auth)])
-def list_historical_operation_analyses() -> list[dict[str, Any]]:
-    """Return saved AI conclusions, never the submitted raw operational data."""
-    return store.historical_operation_analyses()
-
-
-@app.post(
-    "/api/historical-operation-analyses",
-    dependencies=[Depends(require_auth), Depends(require_local_settings)],
-)
-def analyze_historical_operation_data(request: HistoricalOperationAnalysisRequest) -> dict[str, Any]:
-    return historical_operation_analysis(request.title, request.prompt, request.data)
-
-
 @app.get("/api/led-schedule", dependencies=[Depends(require_auth)])
 def get_led_schedule() -> dict[str, Any]:
     return led_schedule_config()
 
 
-@app.put(
-    "/api/led-schedule",
-    dependencies=[Depends(require_auth), Depends(require_local_settings)],
-)
-def save_led_schedule(request: LedScheduleRequest) -> dict[str, Any]:
-    try:
-        photoperiod_minutes(request.on_time, request.off_time)
-    except ValueError as error:
-        raise HTTPException(400, str(error)) from error
-    store.set_settings({
-        "led_schedule_enabled": "1" if request.enabled else "0",
-        "led_schedule_on_time": request.on_time,
-        "led_schedule_off_time": request.off_time,
-    })
-    result = reconcile_led_schedule(force=True)
-    return {**result, "saved": True}
-
-
 @app.get("/api/sensors/latest", dependencies=[Depends(require_auth)])
 def latest_sensors() -> dict[str, Any]:
     return latest_with_health()
-
-
-@app.get("/api/settings/growth-score-override", dependencies=[Depends(require_auth)])
-def get_growth_score_override() -> dict[str, Any]:
-    return growth_score_override()
-
-
-@app.put(
-    "/api/settings/growth-score-override",
-    dependencies=[Depends(require_auth), Depends(require_local_settings)],
-)
-def save_growth_score_override(request: GrowthScoreOverrideRequest) -> dict[str, Any]:
-    now = datetime.now(SEOUL).isoformat(timespec="seconds")
-    store.set_settings({
-        "growth_score_override_score": str(request.score),
-        "growth_score_override_reason": request.reason.strip(),
-        "growth_score_override_updated_at": now,
-    })
-    store.workflow("growth_score_override", "saved", f"dashboard display score {request.score}/100 · {request.reason.strip()}")
-    return growth_score_override()
-
-
-@app.delete(
-    "/api/settings/growth-score-override",
-    dependencies=[Depends(require_auth), Depends(require_local_settings)],
-)
-def clear_growth_score_override() -> dict[str, Any]:
-    store.set_settings({
-        "growth_score_override_score": "",
-        "growth_score_override_reason": "",
-        "growth_score_override_updated_at": "",
-    })
-    store.workflow("growth_score_override", "cleared", "dashboard display score reverted to computed sensor score")
-    return growth_score_override()
 
 
 @app.get("/api/sensors/history", dependencies=[Depends(require_auth)])
@@ -3442,18 +3655,6 @@ def excel_datetime(value: Any) -> datetime:
     return parsed.astimezone(SEOUL).replace(tzinfo=None)
 
 
-def optional_excel_number(value: Any) -> float | None:
-    if value is None or isinstance(value, bool) or str(value).strip() == "":
-        return None
-    try:
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError
-        return number
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"숫자 값이 아닙니다: {value}") from error
-
-
 EXCEL_SENSOR_HEADERS = (
     "기록 시각 (KST)", "온도 (°C)", "습도 (%)", "CO₂ (ppm)", "EC (dS/m)", "pH", "양액 온도 (°C)", "데이터 출처",
 )
@@ -3498,7 +3699,7 @@ def export_sensor_history_excel(
     info.append(["내보낸 시각 (KST)", datetime.now(SEOUL).replace(tzinfo=None)])
     info.append(["조회 기간", period_label])
     info.append(["포인트", len(rows)])
-    info.append(["안내", "이 파일을 다시 가져오면 참조 데이터로만 저장되며 자동 제어에는 사용되지 않습니다."])
+    info.append(["안내", "SQLite 실측 원본의 읽기 전용 내보내기 파일입니다. 대시보드에는 다시 가져올 수 없습니다."])
     info.column_dimensions["A"].width = 24
     info.column_dimensions["B"].width = 82
     info["A1"].font = info["B1"].font = Font(bold=True, color="FFFFFF")
@@ -3514,47 +3715,6 @@ def export_sensor_history_excel(
     )
 
 
-@app.post("/api/sensors/import.xlsx", dependencies=[Depends(require_auth), Depends(require_local_settings)])
-async def import_sensor_history_excel(request: Request) -> dict[str, Any]:
-    body = await request.body()
-    if not body:
-        raise HTTPException(400, "Excel file body is empty")
-    if len(body) > 8 * 1024 * 1024:
-        raise HTTPException(413, "Excel file must be 8 MB or smaller")
-    try:
-        workbook = load_workbook(BytesIO(body), read_only=True, data_only=True)
-        sheet = workbook["센서 데이터"] if "센서 데이터" in workbook.sheetnames else workbook.active
-        header = [str(value or "").strip() for value in next(sheet.iter_rows(min_row=1, max_row=1, values_only=True))]
-    except Exception as error:
-        raise HTTPException(400, f"Excel file could not be read: {type(error).__name__}") from error
-    if tuple(header[:len(EXCEL_SENSOR_HEADERS)]) != EXCEL_SENSOR_HEADERS:
-        raise HTTPException(400, "Use the Excel file downloaded from this dashboard (센서 데이터 sheet)")
-    parsed_rows: list[tuple[str, dict[str, Any]]] = []
-    try:
-        for values in sheet.iter_rows(min_row=2, values_only=True):
-            if not any(value is not None and str(value).strip() for value in values):
-                continue
-            if len(parsed_rows) >= 5000:
-                raise ValueError("최대 5,000행까지 가져올 수 있습니다")
-            recorded = values[0]
-            if isinstance(recorded, datetime):
-                if recorded.tzinfo is None:
-                    recorded = recorded.replace(tzinfo=SEOUL)
-                recorded_at = recorded.astimezone(SEOUL).isoformat(timespec="seconds")
-            else:
-                recorded_at = excel_datetime(recorded).replace(tzinfo=SEOUL).isoformat(timespec="seconds")
-            parsed_rows.append((recorded_at, {
-                "air_temp": optional_excel_number(values[1]), "humidity": optional_excel_number(values[2]),
-                "co2": optional_excel_number(values[3]), "ec": optional_excel_number(values[4]),
-                "ph": optional_excel_number(values[5]), "solution_temp": optional_excel_number(values[6]),
-                "imported_from": str(values[7] or "unknown"),
-            }))
-    except (IndexError, ValueError) as error:
-        raise HTTPException(400, f"Excel data format error: {error}") from error
-    inserted = sum(1 for recorded_at, payload in parsed_rows if store.add_imported_sensor(recorded_at, payload))
-    return {"status": "imported", "rows_read": len(parsed_rows), "rows_added": inserted, "rows_skipped": len(parsed_rows) - inserted}
-
-
 @app.get("/api/actuators", dependencies=[Depends(require_auth)])
 def actuators() -> dict[str, Any]:
     with state_lock:
@@ -3565,31 +3725,6 @@ def actuators() -> dict[str, Any]:
             "items": [{"id": key, "state": states.get(key, "unknown"), **value} for key, value in ACTUATORS.items()]}
 
 
-@app.post("/api/actuators/{actuator}/request", dependencies=[Depends(require_auth)])
-def request_actuator(actuator: str, request: ManualRequest) -> dict[str, Any]:
-    if MQTT_SUBSCRIBE_ENABLED:
-        raise HTTPException(409, "Remote MQTT dashboard is read-only")
-    if actuator not in ACTUATORS:
-        raise HTTPException(404, "Unknown actuator")
-    if actuator == "supply" and SUPPLY_CONTINUOUS_ENABLED:
-        raise HTTPException(409, "Supply circulation is fixed to continuous operation")
-    if request.state == "on" and not 0 < request.duration_seconds <= ACTUATORS[actuator]["max_seconds"]:
-        raise HTTPException(400, "Duration exceeds the safety limit")
-    recommendation_id = add_actuator_recommendation({
-        "source": "manual_dashboard", "severity": "manual", "title": f"{ACTUATORS[actuator]['label']} 수동 제어 요청",
-        "rationale": f"{request.operator}: {request.reason}", "actuator": actuator,
-        "requested_state": request.state, "duration_seconds": request.duration_seconds,
-        "evidence": {"operator": request.operator}, "model": None,
-    })
-    telegram_status = telegram_send_approval_requests([recommendation_id], context="수동 제어 요청")
-    return {
-        "id": recommendation_id,
-        "status": "pending",
-        "telegram_status": telegram_status,
-        "message": "승인 대기열에 추가했습니다.",
-    }
-
-
 @app.get("/api/recommendations", dependencies=[Depends(require_auth)])
 def recommendations() -> list[dict[str, Any]]:
     return store.recommendations()
@@ -3598,13 +3733,6 @@ def recommendations() -> list[dict[str, Any]]:
 @app.get("/api/actuator-events", dependencies=[Depends(require_auth)])
 def actuator_events(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
     return store.events(limit)
-
-
-@app.post("/api/recommendations/{recommendation_id}/decision", dependencies=[Depends(require_auth)])
-def decide(recommendation_id: int, request: DecisionRequest) -> dict[str, Any]:
-    if telegram_config()["approval_enabled"]:
-        raise HTTPException(409, "Final approvals are enabled only through Telegram")
-    return decide_recommendation(recommendation_id, request.decision, request.operator, request.note)
 
 
 @app.get("/api/cameras", dependencies=[Depends(require_auth)])

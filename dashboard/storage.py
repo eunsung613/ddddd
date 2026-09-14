@@ -111,6 +111,17 @@ class Store:
                     telegram_status TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS report_insights (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    result_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_report_insights_date
+                    ON report_insights(report_date, id);
+
                 CREATE TABLE IF NOT EXISTS workflow_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL,
@@ -228,7 +239,8 @@ class Store:
                           AVG(co2) AS co2, AVG(ec) AS ec, AVG(ph) AS ph,
                           AVG(solution_temp) AS solution_temp, MAX(source) AS source
                    FROM sensor_readings
-                   WHERE recorded_at >= ? AND recorded_at <= ?
+                   WHERE source != 'imported:excel'
+                     AND recorded_at >= ? AND recorded_at <= ?
                    GROUP BY CAST(strftime('%s', recorded_at) / 3600 AS INTEGER)
                    ORDER BY recorded_at ASC""",
                 (start_text, end_text),
@@ -244,17 +256,46 @@ class Store:
                                MIN({field}) AS minimum, MAX({field}) AS maximum,
                                MIN(recorded_at) AS first_at, MAX(recorded_at) AS last_at
                         FROM sensor_readings
-                        WHERE substr(recorded_at, 1, 10) = ? AND {field} IS NOT NULL""",
+                        WHERE source != 'imported:excel'
+                          AND substr(recorded_at, 1, 10) = ? AND {field} IS NOT NULL""",
                     (report_date,),
                 ).fetchone()
                 result[field] = dict(row) if row and row["count"] else None
         return result
 
+    def sensor_window(self, start_at: str, end_at: str) -> list[dict[str, Any]]:
+        """Return source sensor rows for an auditable report time window."""
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT recorded_at, air_temp, humidity, co2, ec, ph,
+                          solution_temp, source
+                   FROM sensor_readings
+                   WHERE source != 'imported:excel'
+                     AND recorded_at > ? AND recorded_at <= ?
+                   ORDER BY recorded_at ASC""",
+                (start_at, end_at),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_sensor_before(self, end_at: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT * FROM sensor_readings
+                   WHERE source != 'imported:excel' AND recorded_at <= ?
+                   ORDER BY recorded_at DESC LIMIT 1""",
+                (end_at,),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["raw"] = json.loads(item.pop("raw_json"))
+        return item
+
     def day_source_label(self, report_date: str) -> str:
         with self.connect() as db:
             rows = db.execute(
                 """SELECT DISTINCT source FROM sensor_readings
-                   WHERE substr(recorded_at, 1, 10) = ?""",
+                   WHERE source != 'imported:excel' AND substr(recorded_at, 1, 10) = ?""",
                 (report_date,),
             ).fetchall()
         sources = {str(row["source"]) for row in rows}
@@ -387,6 +428,17 @@ class Store:
             rows = db.execute("SELECT * FROM captures ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
+    def captures_for_date(self, report_date: str) -> list[dict[str, Any]]:
+        """Return every capture for one local date, newest first."""
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM captures
+                   WHERE substr(captured_at, 1, 10) = ?
+                   ORDER BY id DESC""",
+                (report_date,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def add_analysis(self, item: dict[str, Any]) -> int:
         with self.connect() as db:
             cursor = db.execute(
@@ -411,6 +463,70 @@ class Store:
             item["result"] = json.loads(item.pop("result_json"))
             result.append(item)
         return result
+
+    def analysis_for_date(self, report_date: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT * FROM analyses
+                   WHERE substr(created_at, 1, 10) = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (report_date,),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["result"] = json.loads(item.pop("result_json"))
+        return item
+
+    def recommendations_between(self, start_at: str, end_at: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM recommendations
+                   WHERE created_at > ? AND created_at <= ?
+                   ORDER BY id ASC""",
+                (start_at, end_at),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = json.loads(item.pop("evidence_json"))
+            result.append(item)
+        return result
+
+    def events_between(self, start_at: str, end_at: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM actuator_events
+                   WHERE created_at > ? AND created_at <= ?
+                   ORDER BY id ASC""",
+                (start_at, end_at),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_report_insight(
+        self, report_date: str, model: str, prompt_version: str, result: dict[str, Any],
+    ) -> int:
+        with self.connect() as db:
+            cursor = db.execute(
+                """INSERT INTO report_insights (
+                       report_date, created_at, model, prompt_version, result_json
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (report_date, self.now(), model, prompt_version, json.dumps(result, ensure_ascii=False)),
+            )
+            return int(cursor.lastrowid)
+
+    def report_insight(self, report_date: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT * FROM report_insights
+                   WHERE report_date = ? ORDER BY id DESC LIMIT 1""",
+                (report_date,),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["result"] = json.loads(item.pop("result_json"))
+        return item
 
     def add_report(self, item: dict[str, Any]) -> int:
         with self.connect() as db:
