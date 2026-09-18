@@ -86,23 +86,50 @@ def temperature_raw_to_c(raw):
 
 
 class PE350Modbus:
-    def __init__(self):
-        from machine import Pin, UART
+    def __init__(self, uart=None, de=None, re=None):
+        """Use the shared RS485 UART when environment sensors already own it.
 
-        self.uart = UART(
-            config.UART_ID,
+        Creating two UART(0) objects on MicroPython can leave the peripheral in
+        an inconsistent state after repeated 9600/38400 bps changes.  Standalone
+        test scripts may still instantiate this class without arguments.
+        """
+        if uart is None:
+            from machine import Pin, UART
+            uart = UART(
+                config.UART_ID,
+                baudrate=config.RS485_BAUD_RATE,
+                bits=config.RS485_BITS,
+                parity=config.RS485_PARITY,
+                stop=config.RS485_STOP,
+                tx=Pin(config.UART_TX_PIN),
+                rx=Pin(config.UART_RX_PIN),
+                timeout=100,
+                timeout_char=20,
+            )
+            de = Pin(config.RS485_DE_PIN, Pin.OUT, value=0)
+            re = Pin(config.RS485_RE_PIN, Pin.OUT, value=0)
+        if de is None or re is None:
+            raise ValueError("Shared RS485 UART requires DE and RE pins")
+        self.uart = uart
+        self.de = de
+        self.re = re
+        self.baud_rate = config.RS485_BAUD_RATE
+        self.receive_mode()
+
+    def configure_uart(self):
+        """Restore PE350's 9600bps before each query on the shared bus."""
+        self.receive_mode()
+        self.uart.init(
             baudrate=config.RS485_BAUD_RATE,
             bits=config.RS485_BITS,
             parity=config.RS485_PARITY,
             stop=config.RS485_STOP,
-            tx=Pin(config.UART_TX_PIN),
-            rx=Pin(config.UART_RX_PIN),
             timeout=100,
             timeout_char=20,
         )
-        self.de = Pin(config.RS485_DE_PIN, Pin.OUT, value=0)
-        self.re = Pin(config.RS485_RE_PIN, Pin.OUT, value=0)
-        self.receive_mode()
+        self.baud_rate = config.RS485_BAUD_RATE
+        self.clear_rx()
+        time.sleep_ms(20)
 
     def receive_mode(self):
         self.de.value(0)
@@ -117,6 +144,7 @@ class PE350Modbus:
             self.uart.read()
 
     def send(self, frame):
+        self.configure_uart()
         self.clear_rx()
         time.sleep_ms(5)
 
@@ -163,11 +191,13 @@ class PE350Modbus:
 
     def read_register(self, register):
         request = make_read_input_register_request(register)
-        print("TX:", format_hex(request))
+        if getattr(config, "PE350_DEBUG", False):
+            print("TX:", format_hex(request))
         self.send(request)
 
         response = self.receive()
-        print("RX:", format_hex(response) if response else "NO RESPONSE")
+        if getattr(config, "PE350_DEBUG", False):
+            print("RX:", format_hex(response) if response else "NO RESPONSE")
         return parse_single_register_response(response)
 
     def read_ec_us_cm(self):

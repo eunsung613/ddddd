@@ -1,0 +1,12 @@
+{
+  "name": "ffk-broccoli-public-viewer",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@vercel/blob": "^1.0.0"
+  }
+}
