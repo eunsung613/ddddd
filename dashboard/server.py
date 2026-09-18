@@ -1,8 +1,8 @@
 """School-laptop smart-farm control center.
 
 The laptop owns USB serial, SQLite, camera capture, AI analysis, reports and
-Telegram notifications. AI only creates recommendations. A named human must
-approve an actuator request before the safety gate can send it to the Pico.
+Telegram notifications. In autonomous mode, deterministic rules execute only
+after the same Pico and fresh-sensor safety gates used for human approval.
 """
 
 from __future__ import annotations
@@ -87,10 +87,14 @@ PUBLIC_DASHBOARD_SYNC_SECONDS = max(
 )
 SENSOR_ALERTS_ENABLED = os.getenv("SMARTFARM_SENSOR_ALERTS_ENABLED", "0") == "1"
 NUTRIENT_FEEDBACK_ENABLED = os.getenv("SMARTFARM_NUTRIENT_FEEDBACK_ENABLED", "0") == "1"
+AUTONOMOUS_CONTROL_ENABLED = os.getenv("SMARTFARM_AUTONOMOUS_CONTROL_ENABLED", "0") == "1"
 EC_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_EC_PULSE_SECONDS", "3")), 15))
 PH_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_PH_PULSE_SECONDS", "1")), 5))
 RAW_WATER_PULSE_SECONDS = max(1, min(int(os.getenv("SMARTFARM_RAW_WATER_PULSE_SECONDS", "10")), 60))
 NUTRIENT_MIX_SECONDS = max(15, min(int(os.getenv("SMARTFARM_NUTRIENT_MIX_SECONDS", "30")), 180))
+NUTRIENT_SESSION_MAX_SECONDS = max(
+    120, min(int(os.getenv("SMARTFARM_NUTRIENT_SESSION_MAX_SECONDS", "900")), 1800)
+)
 RULE_ALERT_COOLDOWN_SECONDS = max(300, min(int(os.getenv("SMARTFARM_RULE_ALERT_COOLDOWN_SECONDS", "900")), 3600))
 RULE_ALERT_REPEAT_SECONDS = max(1800, min(int(os.getenv("SMARTFARM_RULE_ALERT_REPEAT_SECONDS", "21600")), 86400))
 TELEGRAM_DIVIDER = "────────────────────"
@@ -103,8 +107,9 @@ TEMPERATURE_HIGH_ALERT_CLEAR_MARGIN = 0.5
 HUMIDITY_HIGH_ALERT_CLEAR_MARGIN = 3.0
 DEFAULT_GROWTH_STAGE = os.getenv("SMARTFARM_DEFAULT_GROWTH_STAGE", "육묘기").strip() or "육묘기"
 
-# Profiles are conservative nutrient-solution operating bands.  An AI image
-# observation can select a profile, but it never sends a relay command itself.
+# Profiles are conservative nutrient-solution operating bands. An AI image
+# observation can select a profile, while deterministic checks remain the only
+# path allowed to issue an automatic relay command.
 GROWTH_STAGE_PROFILES = {
     "육묘기": {"ec_low": 1.0, "ec_target": 1.3, "ec_high": 1.5, "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.2, "temp_low": 15.0, "temp_target": 19.0, "temp_high": 22.0, "humidity_low": 60.0, "humidity_target": 68.0, "humidity_high": 75.0},
     "활착기": {"ec_low": 1.3, "ec_target": 1.5, "ec_high": 1.8, "ph_low": 5.8, "ph_target": 6.0, "ph_high": 6.3, "temp_low": 16.0, "temp_target": 20.0, "temp_high": 24.0, "humidity_low": 60.0, "humidity_target": 68.0, "humidity_high": 75.0},
@@ -495,7 +500,8 @@ def telegram_config() -> dict[str, Any]:
         "allow_group_members": allow_group_members,
         "config_error": config_error,
         "configured": bool(token and chat_id),
-        "approvals_ready": bool(token and chat_id and (approvers or allow_group_members) and approval_enabled and not config_error),
+        "commands_ready": bool(token and chat_id and (approvers or allow_group_members) and not config_error),
+        "approvals_ready": bool(token and chat_id and (approvers or allow_group_members) and approval_enabled and not AUTONOMOUS_CONTROL_ENABLED and not config_error),
     }
 
 
@@ -508,6 +514,7 @@ def telegram_settings_payload() -> dict[str, Any]:
         "approver_count": len(config["approvers"]),
         "daily_enabled": config["daily_enabled"],
         "approval_enabled": config["approval_enabled"],
+        "autonomous_control_enabled": AUTONOMOUS_CONTROL_ENABLED,
         "allow_group_members": config["allow_group_members"],
         "approvals_ready": config["approvals_ready"],
         "config_error": config["config_error"],
@@ -772,7 +779,7 @@ def process_telegram_message(message: dict[str, Any]) -> None:
         if command not in farm_commands | game_commands and not game_active:
             return
         config = telegram_config()
-        if not config["approvals_ready"] or not telegram_message_authorized(message, config):
+        if not config["commands_ready"] or not telegram_message_authorized(message, config):
             return
         if command in {"/끝말잇기", "/wordchain"}:
             telegram_send_message(word_chain_start(chat_id, telegram_command_argument(text)))
@@ -789,8 +796,9 @@ def process_telegram_message(message: dict[str, Any]) -> None:
                 "/stop · 진행 중 EC/pH 반복 보정과 교반 즉시 중지\n"
                 "/끝말잇기 [단어] 또는 /wordchain [단어] · 끝말잇기 시작\n"
                 "/끝말그만 또는 /endgame · 끝말잇기 종료\n"
-                "/help 또는 /commands · 이 명령어 목록\n\n"
-                "EC/pH 펌프는 Telegram 승인 버튼을 누른 경우에만 동작합니다."
+                "/help 또는 /commands · 이 명령어 목록\n\n" +
+                ("EC/pH 펌프는 기준 이탈 시 센서 재검증을 거쳐 자동 동작합니다. /stop으로 즉시 중지할 수 있습니다."
+                 if AUTONOMOUS_CONTROL_ENABLED else "EC/pH 펌프는 Telegram 승인 버튼을 누른 경우에만 동작합니다.")
             )
         elif command == "/start":
             telegram_send_message(
@@ -1522,10 +1530,12 @@ def add_post_raw_water_ec_recommendation(
 
 
 def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
-    """Repeat a human-approved correction to its stage target, with Telegram /stop."""
+    """Run a bounded, sensor-verified correction with Telegram /stop available."""
     actuator = str(item["actuator"])
     label = ACTUATORS[actuator]["label"]
     started_id = f"session:{secrets.token_hex(8)}"
+    started_at = time.monotonic()
+    autonomous_followups: list[int] = []
     try:
         nutrient_session_cancel.clear()
         nutrient_session_state.update({"actuator": actuator, "operator": operator})
@@ -1533,12 +1543,17 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
             "command_id": started_id, "actuator": actuator,
             "requested_state": "on", "duration_seconds": nutrient_pulse_seconds(actuator),
             "source": f"feedback_session:{operator}", "result": "session_started",
-            "note": "승인된 폐루프 보정 시작 · 목표 범위까지 반복",
+            "note": "자동 안전 규칙 폐루프 보정 시작 · 목표 범위까지 반복",
         })
         profile = dict((item.get("evidence") or {}).get("growth_profile") or growth_stage_profile()[1])
         stage = str((item.get("evidence") or {}).get("growth_stage") or growth_stage_profile()[0])
         pulse = 0
         while True:
+            if time.monotonic() - started_at > NUTRIENT_SESSION_MAX_SECONDS:
+                note = f"보정 세션 최대 {NUTRIENT_SESSION_MAX_SECONDS}초 경과 · 추가 주입 차단"
+                close_nutrient_session(item, "safety_stopped", operator, note)
+                telegram_session_notice(f"⚠️ {label} 보정 안전 중단\n{note}")
+                return
             latest = latest_with_health()
             if not latest.get("pe350_connected"):
                 raise RuntimeError("PE350 데이터가 지연되어 보정을 중단함")
@@ -1571,9 +1586,14 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
                 if float(after["ec"]) < float(profile["ec_low"]):
                     recommendation_id = add_post_raw_water_ec_recommendation(after, item, stage, profile)
                     if recommendation_id:
-                        telegram_send_approval_requests([recommendation_id], context="원수 보정 후 EC 재측정")
-                        note += " · EC가 낮아 A+B 별도 승인 요청을 전송"
-                telegram_session_notice(f"🥦 원수 보정 완료\n{note}\nA+B는 별도 Telegram 승인 없이는 작동하지 않습니다.")
+                        if AUTONOMOUS_CONTROL_ENABLED:
+                            autonomous_followups.append(recommendation_id)
+                            note += " · EC가 낮아 A+B 자동 후속 보정을 예약"
+                        else:
+                            telegram_send_approval_requests([recommendation_id], context="원수 보정 후 EC 재측정")
+                            note += " · EC가 낮아 A+B 별도 승인 요청을 전송"
+                closing = "A+B는 자동 재측정 안전검사 후에만 후속 보정합니다." if AUTONOMOUS_CONTROL_ENABLED else "A+B는 별도 Telegram 승인 없이는 작동하지 않습니다."
+                telegram_session_notice(f"🥦 원수 보정 완료\n{note}\n{closing}")
                 return
             if actuator == "ec" and latest.get("ec") is not None and float(latest["ec"]) > float(profile["ec_high"]):
                 note = f"EC 상한 초과 감지: {nutrient_value_text(actuator, latest)} · A+B 추가 주입 차단"
@@ -1618,6 +1638,8 @@ def run_nutrient_feedback_session(item: dict[str, Any], operator: str) -> None:
     finally:
         nutrient_session_state.update({"actuator": None, "operator": None})
         nutrient_session_lock.release()
+        if autonomous_followups and AUTONOMOUS_CONTROL_ENABLED:
+            execute_autonomous_recommendations(autonomous_followups, context="원수 보정 후 EC 재측정")
 
 
 def start_nutrient_feedback_session(item: dict[str, Any], operator: str) -> tuple[str, str]:
@@ -1630,7 +1652,7 @@ def start_nutrient_feedback_session(item: dict[str, Any], operator: str) -> tupl
         name=f"nutrient-feedback-{item['actuator']}",
     )
     worker.start()
-    return "executing", "승인된 보정 세션을 시작했습니다. 주입·교반·PE350 재측정 기록을 확인하세요."
+    return "executing", "자동 보정 세션을 시작했습니다. 주입·교반·PE350 재측정 기록을 확인하세요."
 
 
 def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
@@ -1660,7 +1682,7 @@ def safe_execute(item: dict[str, Any], operator: str) -> tuple[str, str]:
         return "simulated", note
     if item.get("source") == "nutrient_feedback_rule":
         if not nutrient_request_matches_policy(item):
-            raise HTTPException(409, "Dosing policy changed; request a fresh Telegram approval")
+            raise HTTPException(409, "Dosing policy changed; a fresh sensor evaluation is required")
         latest = latest_with_health()
         if not latest.get("pe350_connected"):
             raise HTTPException(409, "PE350 evidence is incomplete or stale")
@@ -2540,11 +2562,12 @@ def create_rule_recommendations(latest: dict[str, Any], analysis: dict[str, Any]
     if low_ph_recovery:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
-            "title": f"{stage} pH 낮음: 원수 {RAW_WATER_PULSE_SECONDS}초 보정 승인 요청",
+            "title": f"{stage} pH 낮음: 원수 {RAW_WATER_PULSE_SECONDS}초 {'자동 보정' if AUTONOMOUS_CONTROL_ENABLED else '보정 승인 요청'}",
             "rationale": (
                 f"AI 판단 단계: {stage}. 현재 pH {float(ph):.2f}는 관리 하한 {profile['ph_low']:.1f}보다 낮음. "
-                f"승인 시 원수를 {RAW_WATER_PULSE_SECONDS}초 한 번만 주입하고 {NUTRIENT_MIX_SECONDS}초 교반·PE350 재측정. "
-                f"재측정 EC가 낮을 때만 A+B 별도 Telegram 승인을 요청하며 자동 주입하지 않음. /stop으로 중단 가능"
+                f"원수를 {RAW_WATER_PULSE_SECONDS}초 한 번만 주입하고 {NUTRIENT_MIX_SECONDS}초 교반·PE350 재측정. "
+                + ("재측정 EC가 낮으면 A+B 보정 조건을 다시 평가합니다. /stop으로 중단 가능" if AUTONOMOUS_CONTROL_ENABLED
+                   else "재측정 EC가 낮을 때만 A+B 별도 Telegram 승인을 요청하며 자동 주입하지 않음. /stop으로 중단 가능")
             ),
             "actuator": "raw_water", "requested_state": "on", "duration_seconds": RAW_WATER_PULSE_SECONDS,
             "evidence": {
@@ -2561,10 +2584,10 @@ def create_rule_recommendations(latest: dict[str, Any], analysis: dict[str, Any]
     if NUTRIENT_FEEDBACK_ENABLED and pe350_ready and not low_ph_recovery and ec is not None and float(ec) < profile["ec_low"]:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
-            "title": f"{stage} EC 낮음: A+B {EC_PULSE_SECONDS}초 보정 승인 요청",
+            "title": f"{stage} EC 낮음: A+B {EC_PULSE_SECONDS}초 {'자동 보정' if AUTONOMOUS_CONTROL_ENABLED else '보정 승인 요청'}",
             "rationale": (
                 f"AI 판단 단계: {stage}. 현재 EC {float(ec):.3f} dS/m는 목표 {profile['ec_target']:.1f} "
-                f"(관리 {profile['ec_low']:.1f}~{profile['ec_high']:.1f})보다 낮음. 승인 시 A+B를 "
+                f"(관리 {profile['ec_low']:.1f}~{profile['ec_high']:.1f})보다 낮음. A+B를 "
                 f"{EC_PULSE_SECONDS}초씩 주입하고 {NUTRIENT_MIX_SECONDS}초 교반·재측정을 목표값까지 반복. /stop으로 중단 가능"
             ),
             "actuator": "ec", "requested_state": "on", "duration_seconds": EC_PULSE_SECONDS,
@@ -2582,10 +2605,10 @@ def create_rule_recommendations(latest: dict[str, Any], analysis: dict[str, Any]
     if NUTRIENT_FEEDBACK_ENABLED and pe350_ready and ph is not None and float(ph) > profile["ph_high"]:
         candidates.append({
             "source": "nutrient_feedback_rule", "severity": "warning",
-            "title": f"{stage} pH 높음: 산성액 {PH_PULSE_SECONDS}초 보정 승인 요청",
+            "title": f"{stage} pH 높음: 산성액 {PH_PULSE_SECONDS}초 {'자동 보정' if AUTONOMOUS_CONTROL_ENABLED else '보정 승인 요청'}",
             "rationale": (
                 f"AI 판단 단계: {stage}. 현재 pH {float(ph):.2f}는 목표 {profile['ph_target']:.1f} "
-                f"(관리 {profile['ph_low']:.1f}~{profile['ph_high']:.1f})보다 높음. 승인 시 산성 pH 조절액을 "
+                f"(관리 {profile['ph_low']:.1f}~{profile['ph_high']:.1f})보다 높음. 산성 pH 조절액을 "
                 f"{PH_PULSE_SECONDS}초씩 주입하고 {NUTRIENT_MIX_SECONDS}초 교반·재측정을 목표값까지 반복. /stop으로 중단 가능"
             ),
             "actuator": "ph", "requested_state": "on", "duration_seconds": PH_PULSE_SECONDS,
@@ -2740,6 +2763,8 @@ def telegram_daily_caption(latest: dict[str, Any], analysis: dict[str, Any], cap
     warning = ""
     if score.get("missing"):
         warning = f"\n⚠️ 산출 불가 항목: {', '.join(score['missing'])}"
+    elif AUTONOMOUS_CONTROL_ENABLED:
+        warning = "\n🤖 기준 이탈 시 최신 센서 재검증 후 자동 조치하며, 모든 결과는 감사로그에 남깁니다."
     elif score["status"] in {"주의", "위험"}:
         warning = "\n⚠️ 기준 이탈 항목은 현장 확인 후에만 제어를 승인하세요."
     return (
@@ -2785,7 +2810,7 @@ def publish_confirmed_stage_transition(analysis: dict[str, Any]) -> dict[str, An
         f"EC {profile['ec_low']:.1f}~{profile['ec_high']:.1f} (목표 {profile['ec_target']:.1f})\n"
         f"pH {profile['ph_low']:.1f}~{profile['ph_high']:.1f} (목표 {profile['ph_target']:.1f})\n"
         f"기온 {profile['temp_low']:.0f}~{profile['temp_high']:.0f}℃ · 습도 {profile['humidity_low']:.0f}~{profile['humidity_high']:.0f}%\n"
-        "변경된 기준은 점수·환경 제안에 반영됩니다. 릴레이는 별도 사람 승인 없이는 동작하지 않습니다."
+        "변경된 기준은 점수·환경 자동 제어 기준에 반영됩니다. 모든 실행은 Pico 안전검사와 감사로그를 거칩니다."
     )
     telegram_status = "not_configured"
     try:
@@ -2879,7 +2904,7 @@ def telegram_send_approval_requests(recommendation_ids: list[int], *, context: s
 
 
 def telegram_daily_brief_job(force: bool = False) -> dict[str, Any]:
-    """Capture, observe, and send a noon status. It never executes a command itself."""
+    """Capture, observe, apply enabled automatic rules, then send the status."""
     config = telegram_config()
     if not force and not config["daily_enabled"]:
         return {"status": "disabled"}
@@ -2889,10 +2914,15 @@ def telegram_daily_brief_job(force: bool = False) -> dict[str, Any]:
     try:
         captures = capture_cameras()
         analysis = run_analysis()
+        if AUTONOMOUS_CONTROL_ENABLED:
+            execute_autonomous_recommendations(
+                list(analysis.get("recommendation_ids") or []) + pending_autonomous_recommendation_ids(),
+                context="정오 사진·센서 분석",
+            )
         capture = most_recent_capture()
         capture_path = Path(capture["path"]) if capture and capture.get("path") else None
         latest = latest_with_health()
-        keyboard = telegram_approval_keyboard(analysis.get("recommendation_ids", []))
+        keyboard = None if AUTONOMOUS_CONTROL_ENABLED else telegram_approval_keyboard(analysis.get("recommendation_ids", []))
         caption = telegram_daily_caption(latest, analysis, bool(capture_path and capture_path.exists()))
         if capture_path and capture_path.exists():
             telegram_send_photo(capture_path, caption, keyboard)
@@ -2929,6 +2959,84 @@ def deterministic_rule_still_active(item: dict[str, Any], latest: dict[str, Any]
     if rule_key == "humidity_high":
         return latest.get("humidity") is not None and float(latest["humidity"]) > float(evidence.get("threshold", 80.0))
     return False
+
+
+AUTONOMOUS_RECOMMENDATION_SOURCES = {"deterministic_rule", "nutrient_feedback_rule"}
+
+
+def autonomous_recommendation_is_current(item: dict[str, Any], latest: dict[str, Any]) -> bool:
+    """Recheck a queued automatic action against fresh data before any command."""
+    if not latest.get("pico_connected"):
+        return False
+    source = str(item.get("source") or "")
+    if source == "deterministic_rule":
+        return bool(latest.get("sensor_control_ready")) and deterministic_rule_still_active(item, latest)
+    if source != "nutrient_feedback_rule" or not latest.get("pe350_connected"):
+        return False
+    evidence = dict(item.get("evidence") or {})
+    profile = dict(evidence.get("growth_profile") or {})
+    actuator = str(item.get("actuator") or "")
+    try:
+        if actuator == "raw_water":
+            return float(latest["ph"]) < float(profile["ph_low"])
+        if actuator == "ec":
+            return (
+                float(latest["ec"]) < float(profile["ec_low"])
+                and float(latest["ph"]) >= float(profile["ph_low"])
+            )
+        if actuator == "ph":
+            return float(latest["ph"]) > float(profile["ph_high"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return False
+
+
+def pending_autonomous_recommendation_ids() -> list[int]:
+    """Return current system-rule items; manual targets are never auto-executed."""
+    return [
+        int(item["id"])
+        for item in store.recommendations(200)
+        if item.get("status") == "pending"
+        and item.get("source") in AUTONOMOUS_RECOMMENDATION_SOURCES
+        and isinstance(item.get("id"), int)
+    ]
+
+
+def execute_autonomous_recommendations(recommendation_ids: list[int], *, context: str) -> list[dict[str, str]]:
+    """Apply automatic rules through the normal safety gate, never via Telegram."""
+    if not AUTONOMOUS_CONTROL_ENABLED:
+        return []
+    outcomes: list[dict[str, str]] = []
+    for recommendation_id in dict.fromkeys(recommendation_ids):
+        item = store.recommendation(int(recommendation_id))
+        if not item or item.get("status") != "pending":
+            continue
+        if item.get("source") not in AUTONOMOUS_RECOMMENDATION_SOURCES:
+            continue
+        latest = latest_with_health()
+        if not autonomous_recommendation_is_current(item, latest):
+            note = "자동 실행 전 실측 재검증에서 조건이 해소되었거나 센서 근거가 부족해 실행하지 않음"
+            with recommendation_lock:
+                current = store.recommendation(int(recommendation_id))
+                if current and current.get("status") == "pending":
+                    store.decide_recommendation(int(recommendation_id), "superseded", "autonomous-rule", note)
+                    record_decision_event(current, int(recommendation_id), "superseded", "autonomous-rule", note)
+            outcomes.append({"id": str(recommendation_id), "status": "superseded", "note": note})
+            continue
+        result = decide_recommendation(
+            int(recommendation_id), "approve", "autonomous-rule", f"자동 규칙 실행 · {context}"
+        )
+        outcomes.append({"id": str(recommendation_id), **result})
+    if outcomes:
+        summary = ", ".join(f"#{item['id']}={item['status']}" for item in outcomes)
+        store.workflow("autonomous_control", "success", f"context={context}; {summary}")
+    return outcomes
+
+
+def autonomous_sensor_cycle(latest: dict[str, Any], analysis: dict[str, Any], *, context: str) -> list[dict[str, str]]:
+    """Create current rule items, then automatically execute only those still valid."""
+    created = create_rule_recommendations(latest, analysis)
+    return execute_autonomous_recommendations(created + pending_autonomous_recommendation_ids(), context=context)
 
 
 def refresh_expired_nutrient_approval(item: dict[str, Any]) -> list[int]:
@@ -3031,7 +3139,7 @@ def telegram_poll_worker() -> None:
     bootstrap = True
     while not stop_event.is_set():
         config = telegram_config()
-        if not config["approvals_ready"]:
+        if not config["commands_ready"]:
             update_runtime(telegram_polling=False)
             stop_event.wait(3)
             continue
@@ -3287,11 +3395,17 @@ def create_report(
 def capture_and_analyze_job() -> None:
     capture_cameras()
     analysis = run_analysis()
-    telegram_send_approval_requests(analysis.get("recommendation_ids", []), context="정기 분석")
+    if AUTONOMOUS_CONTROL_ENABLED:
+        execute_autonomous_recommendations(
+            list(analysis.get("recommendation_ids") or []) + pending_autonomous_recommendation_ids(),
+            context="정기 사진·센서 분석",
+        )
+    else:
+        telegram_send_approval_requests(analysis.get("recommendation_ids", []), context="정기 분석")
 
 
 def sensor_alert_job() -> None:
-    """Create only bounded rule proposals; Telegram approval remains mandatory."""
+    """Run bounded rules: autonomous execution or Telegram approval by configuration."""
     if not SENSOR_ALERTS_ENABLED:
         return
     latest = latest_with_health()
@@ -3299,9 +3413,12 @@ def sensor_alert_job() -> None:
         return
     previous_row = (store.analyses(1) or [{}])[0]
     previous = dict(previous_row.get("result") or {})
-    recommendation_ids = create_rule_recommendations(latest, previous)
-    if recommendation_ids:
-        telegram_send_approval_requests(recommendation_ids, context="실시간 센서 경보")
+    if AUTONOMOUS_CONTROL_ENABLED:
+        autonomous_sensor_cycle(latest, previous, context="실시간 센서 규칙")
+    else:
+        recommendation_ids = create_rule_recommendations(latest, previous)
+        if recommendation_ids:
+            telegram_send_approval_requests(recommendation_ids, context="실시간 센서 경보")
 
 
 def daily_report_job() -> None:
@@ -3412,6 +3529,7 @@ def health() -> dict[str, Any]:
         "automation_enabled": AUTOMATION_ENABLED, "configured_model": OPENAI_MODEL,
         "sensor_alerts_enabled": SENSOR_ALERTS_ENABLED,
         "nutrient_feedback_enabled": NUTRIENT_FEEDBACK_ENABLED,
+        "autonomous_control_enabled": AUTONOMOUS_CONTROL_ENABLED,
         "supply_continuous_enabled": SUPPLY_CONTINUOUS_ENABLED,
         "nutrient_session_active": nutrient_session_lock.locked(),
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),

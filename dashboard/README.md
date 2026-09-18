@@ -163,6 +163,15 @@ http://192.168.0.60/ISAPI/Streaming/channels/101/picture
 
 ## 텔레그램 정오 브리핑과 승인
 
+`SMARTFARM_AUTONOMOUS_CONTROL_ENABLED=1`이면 Telegram 제안·승인 버튼을 보내지 않습니다.
+서버는 60초마다 최신 RS485 실측값을 다시 확인한 뒤, 고온·고습 환풍기와 EC·pH·원수
+보정 규칙을 자동 실행합니다. Telegram은 정오 브리핑, 자동 조치 결과, 그리고 지정
+사용자의 `/stop` 비상정지 용도로만 사용합니다. 이 모드에서도 Pico 자동 OFF, 펄스별
+최대 시간, PE350 신선도 검사, 교반 후 재측정, `SMARTFARM_NUTRIENT_SESSION_MAX_SECONDS`
+세션 감시, EC 상한/pH 하한 차단과 전체 감사로그는 해제되지 않습니다.
+
+`SMARTFARM_AUTONOMOUS_CONTROL_ENABLED=0`일 때만 아래의 Telegram 승인 절차가 적용됩니다.
+
 시스템 페이지의 `텔레그램 정오 알림·최종 승인`에서 봇 토큰, 대상 채팅 ID,
 승인자 Telegram 숫자 ID 또는 FFK 그룹 전체 승인 옵션을 저장합니다. 토큰은 서버의 `.env`에만 저장되며 화면에
 다시 표시되지 않습니다. 매일 12:00(Asia/Seoul)에 카메라 촬영, AI 관찰, 센서
