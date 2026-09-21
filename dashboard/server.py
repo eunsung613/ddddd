@@ -739,6 +739,7 @@ def telegram_status_text() -> str:
     score_text = f"{score['score']}점 · {score['status']}" if score.get("score") is not None else "판단 불가 · 센서 근거 확인 필요"
     reasons = "\n".join(f"• {item}" for item in score.get("reasons", [])[:2])
     ai = score["ai_observation"]
+    control_mode = "자동 제어 · 센서 재검증 후 실행" if AUTONOMOUS_CONTROL_ENABLED else "Telegram 승인 제어 · 버튼 승인 후 실행"
     return (
         "🥦 브로콜리 현재 상태\n"
         f"{TELEGRAM_DIVIDER}\n"
@@ -746,6 +747,7 @@ def telegram_status_text() -> str:
         "[관리 환경]\n"
         f"점수  | {score_text}\n"
         f"단계  | {stage} · EC 목표 {profile['ec_target']:.1f} · pH 목표 {profile['ph_target']:.1f}\n"
+        f"제어  | {control_mode}\n"
         f"실측  | EC {latest.get('ec', '--')} dS/m · pH {latest.get('ph', '--')}\n"
         f"      | {latest.get('air_temp', '--')}℃ · 습도 {latest.get('humidity', '--')}% · CO₂ {latest.get('co2', '--')} ppm\n"
         f"{TELEGRAM_DIVIDER}\n"
@@ -766,6 +768,54 @@ def telegram_message_authorized(message: dict[str, Any], config: dict[str, Any])
     )
 
 
+def set_autonomous_control_mode(enabled: bool, operator: str) -> str:
+    """Switch between automatic rules and Telegram approval without restarting."""
+    global AUTONOMOUS_CONTROL_ENABLED
+    if AUTONOMOUS_CONTROL_ENABLED == enabled:
+        return "🤖 자동 제어는 이미 켜져 있습니다." if enabled else "👤 Telegram 승인 제어가 이미 켜져 있습니다."
+
+    config = telegram_config()
+    if not enabled and not config["commands_ready"]:
+        raise RuntimeError("승인 제어를 켜려면 봇·대상 채팅·승인자 설정이 필요합니다.")
+
+    # Approval stays configured while automatic mode is active, but its buttons
+    # are masked by telegram_config(). This makes the off transition immediate.
+    update_env_file({
+        "SMARTFARM_AUTONOMOUS_CONTROL_ENABLED": "1" if enabled else "0",
+        "SMARTFARM_TELEGRAM_APPROVAL_ENABLED": "0" if enabled else "1",
+    })
+    AUTONOMOUS_CONTROL_ENABLED = enabled
+
+    superseded = 0
+    if enabled:
+        # Do not reinterpret an old human-approval proposal as a new automatic
+        # command. Fresh current data must create the automatic decision.
+        for item in store.recommendations(200):
+            if item.get("status") != "pending" or item.get("source") not in AUTONOMOUS_RECOMMENDATION_SOURCES:
+                continue
+            recommendation_id = int(item["id"])
+            note = "자동 제어 전환: 기존 승인 대기를 현재 센서 기준으로 교체"
+            store.decide_recommendation(recommendation_id, "superseded", operator, note)
+            record_decision_event(item, recommendation_id, "superseded", operator, note)
+            superseded += 1
+    elif nutrient_session_lock.locked():
+        # Turning automation off must not leave an already-running automatic
+        # EC/pH feedback loop active behind the new approval-mode UI.
+        cancel_nutrient_feedback(f"mode-switch:{operator}")
+
+    store.workflow(
+        "control_mode",
+        "automatic" if enabled else "telegram_approval",
+        f"operator={operator}; superseded={superseded}",
+    )
+    # Immediately evaluate the latest physical data in the newly selected mode.
+    # It either executes a fresh automatic rule or sends a normal approval card.
+    sensor_alert_job()
+    if enabled:
+        return "🤖 자동 제어를 켰습니다. 기존 대기 제안은 폐기하고 최신 센서값으로 다시 판단합니다. /stop으로 즉시 중지할 수 있습니다."
+    return "👤 자동 제어를 껐습니다. 이제 기준 이탈 시 텔레그램 승인 버튼을 보내고, 승인 후에만 동작합니다."
+
+
 def process_telegram_message(message: dict[str, Any]) -> None:
     """Handle Telegram commands and the isolated, non-farm word-chain game."""
     try:
@@ -775,7 +825,10 @@ def process_telegram_message(message: dict[str, Any]) -> None:
         with word_chain_lock:
             game_active = chat_id in word_chain_games
         game_commands = {"/끝말잇기", "/wordchain", "/끝말그만", "/endgame"}
-        farm_commands = {"/start", "/status", "/report", "/stop", "/help", "/commands"}
+        farm_commands = {
+            "/start", "/status", "/report", "/stop", "/help", "/commands",
+            "/auto", "/autocontrol", "/auto_on", "/auto_off", "/자동제어",
+        }
         if command not in farm_commands | game_commands and not game_active:
             return
         config = telegram_config()
@@ -794,6 +847,8 @@ def process_telegram_message(message: dict[str, Any]) -> None:
                 "/status · 현재 센서·펌프·승인 대기 상태\n"
                 "/report · 최신 촬영, AI 분석, 사진 브리핑, PDF 보고서 생성\n"
                 "/stop · 진행 중 EC/pH 반복 보정과 교반 즉시 중지\n"
+                "/auto on 또는 /자동제어 켜기 · 자동 제어 시작\n"
+                "/auto off 또는 /자동제어 끄기 · Telegram 승인 방식으로 전환\n"
                 "/끝말잇기 [단어] 또는 /wordchain [단어] · 끝말잇기 시작\n"
                 "/끝말그만 또는 /endgame · 끝말잇기 종료\n"
                 "/help 또는 /commands · 이 명령어 목록\n\n" +
@@ -812,6 +867,25 @@ def process_telegram_message(message: dict[str, Any]) -> None:
             ).start()
         elif command == "/stop":
             telegram_send_message("🛑 " + cancel_nutrient_feedback(f"telegram:{(message.get('from') or {}).get('id')}"))
+        elif command in {"/auto", "/autocontrol", "/자동제어", "/auto_on", "/auto_off"}:
+            argument = telegram_command_argument(text).strip().lower()
+            enabled = (
+                command == "/auto_on"
+                or (command not in {"/auto_off"} and argument in {"on", "켜기", "시작", "자동"})
+            )
+            disabled = (
+                command == "/auto_off"
+                or (command not in {"/auto_on"} and argument in {"off", "끄기", "중지", "승인"})
+            )
+            if not enabled and not disabled:
+                telegram_send_message(
+                    "🤖 제어 모드 전환\n"
+                    "/auto on · 자동 제어\n"
+                    "/auto off · Telegram 승인 제어"
+                )
+            else:
+                operator = f"telegram:{(message.get('from') or {}).get('id')}"
+                telegram_send_message(set_autonomous_control_mode(enabled, operator))
         elif game_active:
             response = word_chain_play(chat_id, text)
             if response:
