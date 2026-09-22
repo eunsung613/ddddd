@@ -3983,6 +3983,25 @@ def analysis_now() -> dict[str, Any]:
     return run_analysis()
 
 
+@app.post(
+    "/api/workflows/sensor-rules",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def evaluate_sensor_rules_now() -> dict[str, Any]:
+    """Evaluate live rules now; approval mode only creates Telegram proposals."""
+    if not SENSOR_ALERTS_ENABLED:
+        raise HTTPException(409, "Real-time sensor rules are disabled")
+    sensor_alert_job()
+    pending = [
+        item for item in store.recommendations(50)
+        if item.get("status") == "pending" and item.get("source") in AUTONOMOUS_RECOMMENDATION_SOURCES
+    ]
+    return {
+        "mode": "autonomous" if AUTONOMOUS_CONTROL_ENABLED else "telegram_approval",
+        "pending_recommendations": pending,
+    }
+
+
 @app.get("/api/analyses", dependencies=[Depends(require_auth)])
 def analyses() -> list[dict[str, Any]]:
     return store.analyses()
