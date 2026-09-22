@@ -3019,7 +3019,7 @@ def recommendation_is_fresh(item: dict[str, Any]) -> bool:
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=SEOUL)
         ttl = int(os.getenv("SMARTFARM_TELEGRAM_APPROVAL_TTL_SECONDS", "600"))
-        return datetime.now(SEOUL) - created_at.astimezone(SEOUL) <= timedelta(seconds=max(30, min(ttl, 3600)))
+        return datetime.now(SEOUL) - created_at.astimezone(SEOUL) <= timedelta(seconds=max(30, min(ttl, 7200)))
     except (KeyError, TypeError, ValueError):
         return False
 
