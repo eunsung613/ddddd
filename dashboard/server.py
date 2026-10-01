@@ -4002,6 +4002,26 @@ def evaluate_sensor_rules_now() -> dict[str, Any]:
     }
 
 
+@app.post(
+    "/api/workflows/emergency-nutrient-stop",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def emergency_nutrient_stop() -> dict[str, Any]:
+    """Immediately cancel feedback and force all dosing/mixing relays OFF."""
+    note = cancel_nutrient_feedback("local-emergency:empty-a-b")
+    blocked = 0
+    for item in store.recommendations(200):
+        if item.get("status") != "pending" or item.get("actuator") != "ec":
+            continue
+        recommendation_id = int(item["id"])
+        reason = "A+B 재고 없음: EC 보정 요청을 안전 차단"
+        store.decide_recommendation(recommendation_id, "blocked", "local-emergency", reason)
+        record_decision_event(item, recommendation_id, "blocked", "local-emergency", reason)
+        blocked += 1
+    store.workflow("emergency_nutrient_stop", "success", f"pending_ec_blocked={blocked}")
+    return {"status": "stopped", "message": note, "pending_ec_blocked": blocked}
+
+
 @app.get("/api/analyses", dependencies=[Depends(require_auth)])
 def analyses() -> list[dict[str, Any]]:
     return store.analyses()
