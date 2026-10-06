@@ -4022,6 +4022,18 @@ def emergency_nutrient_stop() -> dict[str, Any]:
     return {"status": "stopped", "message": note, "pending_ec_blocked": blocked}
 
 
+@app.post(
+    "/api/workflows/supply-recover",
+    dependencies=[Depends(require_auth), Depends(require_local_settings)],
+)
+def recover_supply_circulation() -> dict[str, Any]:
+    """Force a fresh 24-hour supply-pump ON command after physical recovery."""
+    result = reconcile_supply_circulation(force=True)
+    if result.get("result") != "sent":
+        raise HTTPException(409, str(result.get("error") or result.get("result")))
+    return result
+
+
 @app.get("/api/analyses", dependencies=[Depends(require_auth)])
 def analyses() -> list[dict[str, Any]]:
     return store.analyses()
