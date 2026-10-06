@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>FFK 브로콜리 스마트팜 | 조회 전용</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div><p class="eyebrow">FFK SMART FARM · PUBLIC VIEW</p><h1>🥦 브로콜리 통합 현황</h1><p class="sub">학교 서버가 전송한 공개용 실측 요약입니다.</p></div>
+      <div class="readonly">조회 전용<br><small>제어·승인 불가</small></div>
+    </header>
+    <section class="notice">모든 펌프·LED·팬 제어는 학교 서버와 텔레그램 최종 승인에서만 실행됩니다.</section>
+    <section id="status" class="status waiting">학교 서버의 첫 데이터 전송을 기다리고 있습니다.</section>
+    <section class="metrics" id="metrics"></section>
+    <section class="grid">
+      <article class="panel"><p class="eyebrow">GROWTH STATUS</p><h2 id="growth-title">생육 분석 대기</h2><p id="growth-summary">학교 서버에서 분석 결과가 전송되면 표시합니다.</p><dl id="growth-details"></dl></article>
+      <article class="panel"><p class="eyebrow">DATA QUALITY</p><h2 id="data-title">데이터 상태 확인 중</h2><p id="data-details">센서 최신 수신 시각을 확인합니다.</p></article>
+    </section>
+    <section class="panel"><div class="panel-heading"><div><p class="eyebrow">LATEST CAMERA CAPTURES</p><h2>최근 브로콜리 사진</h2></div><small id="camera-time">사진 대기</small></div><div class="photos" id="photos"><p class="empty">공개용 사진을 기다리고 있습니다.</p></div></section>
+    <footer>자동 새로고침 30초 · 마지막 갱신 <span id="refreshed">--</span></footer>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

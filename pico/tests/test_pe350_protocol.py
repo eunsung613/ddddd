@@ -36,17 +36,17 @@ def response_for(raw):
 def main():
     assert_equal(
         make_read_input_register_request(config.PE350_EC_REGISTER),
-        bytes.fromhex("1F 04 00 01 00 01 63 B4"),
+        bytes.fromhex("15 04 00 01 00 01 63 1E"),
         "EC request",
     )
     assert_equal(
         make_read_input_register_request(config.PE350_PH_REGISTER),
-        bytes.fromhex("1F 04 00 02 00 01 93 B4"),
+        bytes.fromhex("15 04 00 02 00 01 93 1E"),
         "pH request",
     )
     assert_equal(
         make_read_input_register_request(config.PE350_TEMPERATURE_REGISTER),
-        bytes.fromhex("1F 04 00 03 00 01 C2 74"),
+        bytes.fromhex("15 04 00 03 00 01 C2 DE"),
         "temperature request",
     )
 
